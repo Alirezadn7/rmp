@@ -1,16 +1,26 @@
 # rmp
 
-A lightweight, fast, and minimalist Terminal User Interface (TUI) music player written in Rust.
+A complete, high-performance, retro Terminal User Interface (TUI) music player written in Rust.
 
 ---
 
 ## Features
 
-- **Interactive TUI**: Built with [Ratatui](https://github.com/ratatui-org/ratatui) and [Crossterm](https://github.com/crossterm-rs/crossterm).
-- **Audio Engine**: Powered by [Rodio](https://github.com/RustAudio/rodio) with support for `.mp3`, `.flac`, `.wav`, and `.ogg`.
-- **Recursive Scanner**: Automatically scans folders and subfolders for audio files.
-- **Volume & Playback Controls**: Intuitive volume gauge and playback management.
-- **Safe Terminal Handling**: RAII guard & panic hook ensure your terminal is cleanly restored upon exit or unexpected crash.
+- **Two-Screen Architecture**:
+  - **Screen 1: Launcher Menu (`AppScreen::Menu`)**: Centered ASCII art banner, recent session resume, customizable numbered route shortcuts (`[1]`..`[9]`), interactive directory browser (`[B]`), and custom route manager (`[A]`).
+  - **Screen 2: Music Player (`AppScreen::Player`)**: Dark theme with cyan/blue accents matching retro audio gear.
+- **Audio Playback Engine**: Powered by `rodio` with support for `.mp3`, `.flac`, `.wav`, `.ogg`, and `.m4a`.
+- **Playback Modes**:
+  - **Shuffle Mode**: Randomized track progression using Fisher-Yates shuffle queue (`[s]`).
+  - **Repeat Mode**: Toggle between `ALL`, `ONE`, and `OFF` (`[r]`).
+  - **Seeking**: Fast forward (`[→]`) and rewind (`[←]`) by 5 seconds.
+  - **Mute Control**: Instant audio muting with volume preservation (`[m]`).
+- **Interactive Visuals**:
+  - **Pixel-Art Spinning Vinyl Disc**: Animated 4-phase rotating vinyl record with groove reflections and center spindle label.
+  - **Live Spectrum Visualizer**: Multi-band equalizer with dynamic frequency synthesis and floating peak hold caps.
+- **Playlist Search & Filter**: Real-time interactive playlist searching (`[/]`).
+- **Config Persistence**: Automatically persists volume, shuffle, repeat, last played directory, and saved routes in `~/.config/rmp/config.toml`.
+- **Terminal Crash Protection**: Custom panic hook and RAII guard to safely restore raw mode and alternate screens.
 
 ---
 
@@ -22,38 +32,68 @@ A lightweight, fast, and minimalist Terminal User Interface (TUI) music player w
 
 ### Installation & Run
 
-1. **Clone the repository:**
+1. **Run directly:**
    ```bash
-   git clone https://github.com/<your-username>/rmp.git
-   cd rmp
+   cargo run
    ```
+   *(Or pass a music path directly: `cargo run -- "C:\path\to\music"`)*
 
-2. **Run pointing to your music directory:**
-   ```bash
-   cargo run -- "C:\path\to\your\music"
+2. **Run optimized release executable:**
+   ```powershell
+   .\target\release\rmp.exe
    ```
-   *(Or simply run `cargo run` if you are already inside a folder with music files).*
-
-3. **Build optimized release binary:**
-   ```bash
-   cargo build --release
-   ```
-   The compiled executable will be located at `target/release/rmp`.
 
 ---
 
 ## Keyboard Controls
 
+### Launcher Menu Screen
 | Key | Action |
 | :--- | :--- |
-| `Enter` | Play selected track |
-| `Space` | Toggle Pause / Resume |
-| `↑` / `↓` or `k` / `j` | Navigate track list |
-| `n` | Next track |
-| `b` | Previous track |
-| `+` / `-` or `→` / `←` | Increase / Decrease volume |
-| `s` | Stop playback |
+| `↑` / `↓` or `k` / `j` | Navigate launcher options |
+| `Space` | **Select** path (marks active route with `●` radio circle) |
+| `Enter` | **Confirm** & Open selected route |
+| `1` – `9` | Instant jump & open corresponding numbered route |
+| `b` or `B` | Open interactive file system folder browser |
+| `a` or `A` | Add new custom music directory path |
+| `d` or `D` | Delete highlighted custom route |
 | `q` or `Esc` | Quit application |
+
+### Music Player Screen
+| Key | Action |
+| :--- | :--- |
+| `Space` | Toggle Play / Pause |
+| `Enter` | Play highlighted track in playlist |
+| `n` | Next track (respects Shuffle / Repeat) |
+| `p` or `b` | Previous track |
+| `s` | Toggle **Shuffle** (ON / OFF) |
+| `r` | Cycle **Repeat** (`ALL` → `ONE` → `OFF`) |
+| `m` | Toggle **Mute** (YES / NO) |
+| `→` / `←` | Seek forward / backward 5 seconds |
+| `+` / `-` | Volume Up / Down (or `=` / `-`) |
+| `/` | Live Playlist Search & Filter |
+| `Esc` | Return to Launcher Menu |
+| `q` or `Q` | Quit application |
+
+---
+
+## Configuration
+
+Settings are saved in `~/.config/rmp/config.toml`:
+
+```toml
+# rmp configuration file
+last_session = "C:\\Users\\Asus\\Music"
+volume = 85
+shuffle = true
+repeat = "ALL"
+
+routes = [
+    "~/Music",
+    "~/Downloads/audio",
+    "/media/external/tracks",
+]
+```
 
 ---
 
