@@ -422,12 +422,22 @@ fn main() -> Result<()> {
         }
     }
 
-    // Main Event Loop
-    let tick_rate = Duration::from_millis(40); // 25 FPS
+    // Main Event Loop with Dynamic Frame Rate / CPU Optimization
     let mut last_tick = Instant::now();
 
     while !app.should_quit {
         terminal.draw(|f| ui(f, &mut app))?;
+
+        let is_playing = app.screen == AppScreen::Player
+            && app.current_track_index.is_some()
+            && !app.player.is_paused();
+
+        // 16ms (~60 FPS) when playing for fluid FFT visualizer motion; 200ms when idle/menu (<1% CPU)
+        let tick_rate = if is_playing {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(200)
+        };
 
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
@@ -443,8 +453,9 @@ fn main() -> Result<()> {
 
         if last_tick.elapsed() >= tick_rate {
             app.frame_counter = app.frame_counter.wrapping_add(1);
-            let is_playing = app.current_track_index.is_some() && !app.player.is_paused();
-            app.spectrum.update(is_playing, app.frame_counter);
+            let active_playing = app.current_track_index.is_some() && !app.player.is_paused();
+            let shared_audio = app.player.audio_buffer();
+            app.spectrum.update(active_playing, &shared_audio);
             app.check_track_completion();
             last_tick = Instant::now();
         }
