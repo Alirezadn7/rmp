@@ -1,0 +1,11 @@
+[package]
+name = "rmp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rodio = "0.19"
+walkdir = "2.5"
+anyhow = "1.0"
+ratatui = "0.29"
+crossterm = "0.28"
