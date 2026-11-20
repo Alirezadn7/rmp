@@ -2,12 +2,14 @@
 //!
 //! Featuring two screens:
 //! 1. `AppScreen::Menu`: Retro ASCII-art Launcher & Directory Selection.
-//! 2. `AppScreen::Player`: High-performance dark-cyan TUI with Playlist, Now Playing,
-//!    animated spinning vinyl pixel art, and live spectrum visualizer.
+//! 2. `AppScreen::Player`: High-performance retro TUI with Playlist, Now Playing,
+//!    animated spinning vinyl + tonearm pixel art, and live spectrum visualizer.
 
 mod config;
 mod player;
+mod playlist;
 mod scanner;
+mod theme;
 mod vinyl;
 mod visualizer;
 
@@ -18,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -27,15 +29,19 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 
 use config::{AppConfig, RepeatMode};
 use player::Player;
+use playlist::{CompletionAction, PlaylistController};
 use scanner::{format_duration_secs, Track};
+use theme::ThemePalette;
 use vinyl::VinylRecord;
 use visualizer::{SpectrumState, SpectrumVisualizer};
+
+const STATUS_DURATION: Duration = Duration::from_secs(4);
 
 /// RAII Guard ensuring terminal raw mode and alternate screen are restored on exit or panic.
 struct TerminalGuard;
@@ -68,6 +74,7 @@ struct BrowseState {
     current_dir: PathBuf,
     entries: Vec<PathBuf>,
     selected: usize,
+    list_state: ListState,
 }
 
 impl BrowseState {
@@ -76,6 +83,7 @@ impl BrowseState {
             current_dir: start_dir,
             entries: Vec::new(),
             selected: 0,
+            list_state: ListState::default(),
         };
         state.refresh();
         state
@@ -84,6 +92,8 @@ impl BrowseState {
     fn refresh(&mut self) {
         self.entries.clear();
         self.selected = 0;
+        self.list_state = ListState::default();
+        self.list_state.select(Some(0));
 
         if let Ok(read_dir) = fs::read_dir(&self.current_dir) {
             let mut dirs = Vec::new();
@@ -94,9 +104,13 @@ impl BrowseState {
                     }
                 }
             }
-            dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+            dirs.sort_by_key(|a| a.file_name().map(|n| n.to_string_lossy().to_lowercase()));
             self.entries = dirs;
         }
+    }
+
+    fn sync_selection(&mut self) {
+        self.list_state.select(Some(self.selected));
     }
 
     fn go_up(&mut self) {
@@ -108,7 +122,6 @@ impl BrowseState {
 
     fn enter_selected(&mut self) -> Option<PathBuf> {
         if self.selected == 0 {
-            // Confirm & Open current folder
             Some(self.current_dir.clone())
         } else if self.selected == 1 {
             self.go_up();
@@ -121,6 +134,14 @@ impl BrowseState {
             None
         }
     }
+}
+
+/// Ephemeral status/error message shown in the TUI status strip
+#[derive(Debug, Clone)]
+struct StatusBanner {
+    text: String,
+    is_error: bool,
+    expires_at: Instant,
 }
 
 /// Application state
@@ -136,19 +157,18 @@ struct App {
 
     // Player screen state
     tracks: Vec<Track>,
+    playlist: PlaylistController,
     playlist_state: ListState,
-    current_track_index: Option<usize>,
-    shuffle_indices: Vec<usize>,
-    shuffle_cursor: usize,
-    repeat: RepeatMode,
-    shuffle: bool,
-    search_query: Option<String>,
-    filtered_indices: Vec<usize>,
+    current_dir_display: String,
+    consecutive_errors: usize,
+
+    // Overlay & Feedback
+    show_help: bool,
+    status_banner: Option<StatusBanner>,
 
     // Animation & Physics
     frame_counter: usize,
     spectrum: SpectrumState,
-    rng_seed: u64,
     should_quit: bool,
 }
 
@@ -159,8 +179,7 @@ impl App {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0xCAFE_BABE);
 
-        let repeat = config.repeat;
-        let shuffle = config.shuffle;
+        let playlist = PlaylistController::new(config.repeat, config.shuffle, seed);
 
         Self {
             screen: AppScreen::Menu,
@@ -170,18 +189,35 @@ impl App {
             chosen_route: 0,
             menu_modal: MenuModal::None,
             tracks: Vec::new(),
+            playlist,
             playlist_state: ListState::default(),
-            current_track_index: None,
-            shuffle_indices: Vec::new(),
-            shuffle_cursor: 0,
-            repeat,
-            shuffle,
-            search_query: None,
-            filtered_indices: Vec::new(),
+            current_dir_display: String::new(),
+            consecutive_errors: 0,
+            show_help: false,
+            status_banner: None,
             frame_counter: 0,
             spectrum: SpectrumState::new(),
-            rng_seed: seed,
             should_quit: false,
+        }
+    }
+
+    fn set_status<S: Into<String>>(&mut self, text: S, is_error: bool) {
+        self.status_banner = Some(StatusBanner {
+            text: text.into(),
+            is_error,
+            expires_at: Instant::now() + STATUS_DURATION,
+        });
+    }
+
+    fn active_status(&self) -> Option<&StatusBanner> {
+        self.status_banner
+            .as_ref()
+            .filter(|b| Instant::now() < b.expires_at)
+    }
+
+    fn open_directory(&mut self, dir_path: &Path) {
+        if let Err(err) = self.load_directory(dir_path) {
+            self.set_status(err.to_string(), true);
         }
     }
 
@@ -191,199 +227,189 @@ impl App {
             .with_context(|| format!("Failed to scan directory: {}", dir_path.display()))?;
 
         if tracks.is_empty() {
-            // If empty, return error or handle gracefully
             return Err(anyhow::anyhow!(
                 "No supported audio files found in {}",
                 dir_path.display()
             ));
         }
 
+        // Cleanly stop any track from a previous directory before switching
+        self.player.stop();
         self.tracks = tracks;
-        self.filtered_indices = (0..self.tracks.len()).collect();
+        self.playlist.load_tracks(self.tracks.len());
+        self.playlist_state = ListState::default();
         self.playlist_state.select(Some(0));
-        self.current_track_index = None;
-        self.rebuild_shuffle_queue();
+        self.consecutive_errors = 0;
+        self.show_help = false;
+        self.current_dir_display = config::display_path(dir_path);
 
-        // Update config last session
         let path_str = dir_path.display().to_string();
         self.config.last_session = Some(path_str);
         let _ = self.config.save();
 
+        self.set_status(
+            format!("Loaded {} tracks from {}", self.tracks.len(), self.current_dir_display),
+            false,
+        );
         self.screen = AppScreen::Player;
         Ok(())
     }
 
-    fn rebuild_shuffle_queue(&mut self) {
-        self.shuffle_indices = (0..self.tracks.len()).collect();
-        // Fisher-Yates shuffle
-        let n = self.shuffle_indices.len();
-        if n > 1 {
-            for i in (1..n).rev() {
-                let j = (self.next_rand() as usize) % (i + 1);
-                self.shuffle_indices.swap(i, j);
-            }
-        }
-        self.shuffle_cursor = 0;
+    fn stop_playback(&mut self) {
+        self.player.stop();
+        self.playlist.current_track = None;
+        self.consecutive_errors = 0;
     }
 
-    fn next_rand(&mut self) -> u64 {
-        let mut x = self.rng_seed;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng_seed = x;
-        x
-    }
-
-    fn play_track(&mut self, index: usize) {
+    fn play_track(&mut self, index: usize) -> bool {
         if index >= self.tracks.len() {
-            return;
+            return false;
         }
 
-        let track = &self.tracks[index];
-        match self.player.play(&track.path) {
-            Ok(dur) => {
-                self.current_track_index = Some(index);
-                if let Some(d) = dur {
+        let track_path = self.tracks[index].path.clone();
+        let track_name = self.tracks[index].file_name.clone();
+
+        match self.player.play(&track_path) {
+            Ok(info) => {
+                self.playlist.current_track = Some(index);
+                self.playlist.sync_shuffle_cursor(index);
+                self.consecutive_errors = 0;
+                if let Some(d) = info.duration {
                     self.tracks[index].duration = Some(d);
                 }
+                self.spectrum.set_sample_rate(info.sample_rate);
+                true
             }
-            Err(_) => {
-                // If playback failed, try next
+            Err(err) => {
+                self.consecutive_errors += 1;
+                self.set_status(format!("Cannot play '{}': {}", track_name, err), true);
+                false
             }
         }
+    }
+
+    fn select_and_play(&mut self, track_idx: usize) -> bool {
+        if let Some(pos) = self.playlist.filtered_indices.iter().position(|&i| i == track_idx) {
+            self.playlist_state.select(Some(pos));
+        }
+        self.play_track(track_idx)
     }
 
     fn play_selected(&mut self) {
         if let Some(sel) = self.playlist_state.selected() {
-            let actual_idx = if let Some(idx) = self.filtered_indices.get(sel) {
-                *idx
-            } else {
-                sel
-            };
+            let actual_idx = self
+                .playlist
+                .filtered_indices
+                .get(sel)
+                .copied()
+                .unwrap_or(sel);
             self.play_track(actual_idx);
         }
     }
 
-    fn play_next(&mut self) {
+    fn confirm_search_and_play(&mut self) {
+        let chosen_idx = self
+            .playlist_state
+            .selected()
+            .and_then(|sel| self.playlist.filtered_indices.get(sel).copied());
+
+        self.playlist.clear_search();
+
+        if let Some(idx) = chosen_idx {
+            self.select_and_play(idx);
+        } else if let Some(cur) = self.playlist.current_track {
+            self.playlist_state.select(Some(cur));
+        } else if !self.tracks.is_empty() {
+            self.playlist_state.select(Some(0));
+        }
+    }
+
+    fn advance_track(&mut self, forward: bool) {
         if self.tracks.is_empty() {
             return;
         }
 
-        if self.shuffle {
-            self.shuffle_cursor = (self.shuffle_cursor + 1) % self.tracks.len();
-            if self.shuffle_cursor == 0 {
-                self.rebuild_shuffle_queue();
-            }
-            let next_idx = self.shuffle_indices[self.shuffle_cursor];
-            self.select_and_play(next_idx);
-        } else {
-            let next_idx = match self.current_track_index {
-                Some(idx) => (idx + 1) % self.tracks.len(),
-                None => 0,
+        let max_attempts = self.tracks.len();
+        for _ in 0..max_attempts {
+            let candidate = if forward {
+                self.playlist.next_manual()
+            } else {
+                self.playlist.prev_manual()
             };
-            self.select_and_play(next_idx);
+
+            let Some(idx) = candidate else {
+                break;
+            };
+
+            if self.select_and_play(idx) {
+                return;
+            }
+            // Advance pointer so next attempt skips past the broken track
+            self.playlist.current_track = Some(idx);
         }
+
+        self.stop_playback();
+        self.set_status("No playable tracks found in playlist", true);
+    }
+
+    fn play_next(&mut self) {
+        self.advance_track(true);
     }
 
     fn play_prev(&mut self) {
-        if self.tracks.is_empty() {
-            return;
-        }
-
-        if self.shuffle {
-            if self.shuffle_cursor == 0 {
-                self.shuffle_cursor = self.tracks.len().saturating_sub(1);
-            } else {
-                self.shuffle_cursor -= 1;
-            }
-            let prev_idx = self.shuffle_indices[self.shuffle_cursor];
-            self.select_and_play(prev_idx);
-        } else {
-            let prev_idx = match self.current_track_index {
-                Some(idx) => {
-                    if idx == 0 {
-                        self.tracks.len() - 1
-                    } else {
-                        idx - 1
-                    }
-                }
-                None => 0,
-            };
-            self.select_and_play(prev_idx);
-        }
-    }
-
-    fn select_and_play(&mut self, track_idx: usize) {
-        if let Some(pos) = self.filtered_indices.iter().position(|&i| i == track_idx) {
-            self.playlist_state.select(Some(pos));
-        }
-        self.play_track(track_idx);
+        self.advance_track(false);
     }
 
     fn toggle_shuffle(&mut self) {
-        self.shuffle = !self.shuffle;
-        self.config.shuffle = self.shuffle;
+        self.playlist.toggle_shuffle();
+        self.config.shuffle = self.playlist.shuffle;
         let _ = self.config.save();
-        if self.shuffle {
-            self.rebuild_shuffle_queue();
-        }
     }
 
     fn cycle_repeat(&mut self) {
-        self.repeat = self.repeat.next();
-        self.config.repeat = self.repeat;
+        self.playlist.repeat = self.playlist.repeat.next();
+        self.config.repeat = self.playlist.repeat;
         let _ = self.config.save();
     }
 
-    fn update_search_filter(&mut self) {
-        if let Some(ref q) = self.search_query {
-            let q_lower = q.to_lowercase();
-            self.filtered_indices = self
-                .tracks
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| {
-                    t.file_name.to_lowercase().contains(&q_lower)
-                        || t.artist.to_lowercase().contains(&q_lower)
-                        || t.title.to_lowercase().contains(&q_lower)
-                })
-                .map(|(i, _)| i)
-                .collect();
-        } else {
-            self.filtered_indices = (0..self.tracks.len()).collect();
-        }
+    fn cycle_theme(&mut self) {
+        self.config.theme = self.config.theme.next();
+        let _ = self.config.save();
+        self.set_status(format!("Theme: {}", self.config.theme.label()), false);
+    }
 
-        if !self.filtered_indices.is_empty() {
+    fn update_search_filter(&mut self) {
+        self.playlist.apply_search_filter(&self.tracks);
+        if !self.playlist.filtered_indices.is_empty() {
             self.playlist_state.select(Some(0));
         } else {
             self.playlist_state.select(None);
         }
     }
 
-    /// Check if current track ended and handle repeat/shuffle auto-progression
+    /// Check if current track ended and handle repeat/once/shuffle auto-progression
     fn check_track_completion(&mut self) {
-        if self.current_track_index.is_some() && !self.player.is_paused() && self.player.is_empty() {
-            match self.repeat {
-                RepeatMode::One => {
-                    if let Some(idx) = self.current_track_index {
-                        self.play_track(idx);
-                    }
+        if self.playlist.current_track.is_some()
+            && !self.player.is_paused()
+            && self.player.is_empty()
+        {
+            let mut action = self.playlist.next_on_completion();
+            let mut attempts = 0;
+            while let CompletionAction::Play(idx) = action {
+                if self.select_and_play(idx) {
+                    return;
                 }
-                RepeatMode::All => {
-                    self.play_next();
+                attempts += 1;
+                if attempts >= self.tracks.len()
+                    || self.consecutive_errors >= self.tracks.len()
+                {
+                    self.stop_playback();
+                    self.set_status("No playable tracks found in playlist", true);
+                    return;
                 }
-                RepeatMode::Off => {
-                    if let Some(idx) = self.current_track_index {
-                        if idx + 1 < self.tracks.len() {
-                            self.play_next();
-                        } else {
-                            self.player.stop();
-                            self.current_track_index = None;
-                        }
-                    }
-                }
+                action = self.playlist.handle_completion_failure(idx);
             }
+            self.stop_playback();
         }
     }
 }
@@ -392,8 +418,9 @@ fn main() -> Result<()> {
     // 1. Load Configuration
     let config = AppConfig::load();
 
-    // 2. Initialize Player
-    let player = Player::new().context("Failed to initialize audio output engine")?;
+    // 2. Initialize Player with saved volume
+    let player = Player::with_volume(config.volume as f32 / 100.0)
+        .context("Failed to initialize audio output engine")?;
 
     // 3. Setup Terminal
     enable_raw_mode()?;
@@ -411,15 +438,13 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(config.clone(), player);
+    let mut app = App::new(config, player);
 
     // If target directory was passed on CLI arguments, directly open it
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
         let target = PathBuf::from(args.join(" "));
-        if target.exists() {
-            let _ = app.load_directory(&target);
-        }
+        app.open_directory(&target);
     }
 
     // Main Event Loop with Dynamic Frame Rate / CPU Optimization
@@ -429,10 +454,10 @@ fn main() -> Result<()> {
         terminal.draw(|f| ui(f, &mut app))?;
 
         let is_playing = app.screen == AppScreen::Player
-            && app.current_track_index.is_some()
+            && app.playlist.current_track.is_some()
             && !app.player.is_paused();
 
-        // 16ms (~60 FPS) when playing for fluid FFT visualizer motion; 200ms when idle/menu (<1% CPU)
+        // 16ms (~60 FPS) when playing for fluid FFT visualizer motion; 200ms when idle/menu
         let tick_rate = if is_playing {
             Duration::from_millis(16)
         } else {
@@ -445,15 +470,21 @@ fn main() -> Result<()> {
 
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    handle_key_event(&mut app, key.code)?;
+                handle_key_event(&mut app, key)?;
+            }
+            let mut drained = 0;
+            while !app.should_quit && drained < 16 && event::poll(Duration::ZERO)? {
+                if let Event::Key(key) = event::read()? {
+                    handle_key_event(&mut app, key)?;
                 }
+                drained += 1;
             }
         }
 
         if last_tick.elapsed() >= tick_rate {
             app.frame_counter = app.frame_counter.wrapping_add(1);
-            let active_playing = app.current_track_index.is_some() && !app.player.is_paused();
+            let active_playing =
+                app.playlist.current_track.is_some() && !app.player.is_paused();
             let shared_audio = app.player.audio_buffer();
             app.spectrum.update(active_playing, &shared_audio);
             app.check_track_completion();
@@ -464,47 +495,77 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle_key_event(app: &mut App, code: KeyCode) -> Result<()> {
+fn is_plain_char(modifiers: KeyModifiers) -> bool {
+    !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT)
+}
+
+fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<()> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return Ok(());
+    }
+
+    // Global Ctrl+C quit in raw mode
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        app.should_quit = true;
+        return Ok(());
+    }
+
+    // Help overlay intercepts keys cleanly when open
+    if app.show_help {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q' | 'Q') => {
+                app.show_help = false;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match app.screen {
-        AppScreen::Menu => handle_menu_key(app, code),
-        AppScreen::Player => handle_player_key(app, code),
+        AppScreen::Menu => handle_menu_key(app, key),
+        AppScreen::Player => handle_player_key(app, key),
     }
 }
 
 // -----------------------------------------------------------------------------
 // Screen 1: Launcher Menu Key Handling
 // -----------------------------------------------------------------------------
-fn handle_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
-    // Handle modal active in Menu
+fn handle_menu_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let code = key.code;
+
     match &mut app.menu_modal {
         MenuModal::Browse(ref mut browse) => match code {
             KeyCode::Esc => {
                 app.menu_modal = MenuModal::None;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k' | 'K') => {
                 if browse.selected > 0 {
                     browse.selected -= 1;
+                    browse.sync_selection();
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let max = browse.entries.len() + 1; // 0 = confirm current, 1 = parent, 2.. = entries
+            KeyCode::Down | KeyCode::Char('j' | 'J') => {
+                let max = browse.entries.len() + 1;
                 if browse.selected < max {
                     browse.selected += 1;
+                    browse.sync_selection();
                 }
             }
             KeyCode::Enter => {
                 if let Some(confirmed_dir) = browse.enter_selected() {
                     app.menu_modal = MenuModal::None;
-                    let _ = app.load_directory(&confirmed_dir);
+                    app.open_directory(&confirmed_dir);
                 }
             }
-            KeyCode::Backspace | KeyCode::Char('u') => {
+            KeyCode::Backspace | KeyCode::Char('u' | 'U') => {
                 browse.go_up();
             }
-            KeyCode::Char(' ') | KeyCode::Char('o') => {
+            KeyCode::Char(' ' | 'o' | 'O') => {
                 let dir = browse.current_dir.clone();
                 app.menu_modal = MenuModal::None;
-                let _ = app.load_directory(&dir);
+                app.open_directory(&dir);
             }
             _ => {}
         },
@@ -515,66 +576,76 @@ fn handle_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
             KeyCode::Backspace => {
                 input.pop();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if is_plain_char(key.modifiers) => {
                 input.push(c);
             }
             KeyCode::Enter => {
                 let trimmed = input.trim().to_string();
+                app.menu_modal = MenuModal::None;
                 if !trimmed.is_empty() {
                     let resolved = config::resolve_path(&trimmed);
                     if resolved.exists() && resolved.is_dir() {
-                        app.config.routes.push(trimmed);
-                        let _ = app.config.save();
+                        if !app.config.routes.contains(&trimmed) {
+                            app.config.routes.push(trimmed.clone());
+                            let _ = app.config.save();
+                            app.set_status(format!("Added route: {}", trimmed), false);
+                        } else {
+                            app.set_status("Route already exists in list", true);
+                        }
+                    } else {
+                        app.set_status(format!("Directory not found: {}", trimmed), true);
                     }
                 }
-                app.menu_modal = MenuModal::None;
             }
             _ => {}
         },
         MenuModal::None => {
-            let total_items = 1 + app.config.routes.len() + 2; // [Resume] + routes + [Browse] + [Add]
+            let total_items = 1 + app.config.routes.len() + 2;
 
             match code {
-                KeyCode::Char('q') | KeyCode::Esc => {
+                KeyCode::Char('q' | 'Q') | KeyCode::Esc => {
                     app.should_quit = true;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Char('?') => {
+                    app.show_help = true;
+                }
+                KeyCode::Char('t' | 'T') => {
+                    app.cycle_theme();
+                }
+                KeyCode::Up | KeyCode::Char('k' | 'K') => {
                     if app.menu_selected == 0 {
                         app.menu_selected = total_items.saturating_sub(1);
                     } else {
                         app.menu_selected -= 1;
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down | KeyCode::Char('j' | 'J') => {
                     app.menu_selected = (app.menu_selected + 1) % total_items;
                 }
-                // [Space] = SELECT path (marks active route with ● without opening)
                 KeyCode::Char(' ') => {
                     if app.menu_selected <= app.config.routes.len() {
                         app.chosen_route = app.menu_selected;
                     }
                 }
-                // Direct numeric shortcuts [1] to [9]
                 KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                     let route_idx = (c as usize) - ('1' as usize);
-                    if let Some(r) = app.config.routes.get(route_idx) {
+                    if let Some(r) = app.config.routes.get(route_idx).cloned() {
                         app.chosen_route = route_idx + 1;
-                        let path = config::resolve_path(r);
-                        let _ = app.load_directory(&path);
+                        let path = config::resolve_path(&r);
+                        app.open_directory(&path);
                     }
                 }
-                KeyCode::Char('b') | KeyCode::Char('B') => {
+                KeyCode::Char('b' | 'B') => {
                     let start = config::home_dir().unwrap_or_else(|| PathBuf::from("."));
                     app.menu_modal = MenuModal::Browse(BrowseState::new(start));
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
+                KeyCode::Char('a' | 'A') => {
                     app.menu_modal = MenuModal::AddPath(String::new());
                 }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
-                    // Delete highlighted custom route
+                KeyCode::Char('d' | 'D') => {
                     if app.menu_selected > 0 && app.menu_selected <= app.config.routes.len() {
                         let idx = app.menu_selected - 1;
-                        app.config.routes.remove(idx);
+                        let removed = app.config.routes.remove(idx);
                         let _ = app.config.save();
                         app.menu_selected = app.menu_selected.min(total_items.saturating_sub(2));
                         if app.chosen_route > idx + 1 {
@@ -582,38 +653,32 @@ fn handle_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
                         } else if app.chosen_route == idx + 1 {
                             app.chosen_route = 0;
                         }
+                        app.set_status(format!("Removed route: {}", removed), false);
                     }
                 }
-                // [Enter] = CONFIRM & Open
                 KeyCode::Enter => {
                     let routes_len = app.config.routes.len();
                     if app.menu_selected == routes_len + 1 {
-                        // [B] Browse File System...
                         let start = config::home_dir().unwrap_or_else(|| PathBuf::from("."));
                         app.menu_modal = MenuModal::Browse(BrowseState::new(start));
                     } else if app.menu_selected == routes_len + 2 {
-                        // [A] Add New Custom Path...
                         app.menu_modal = MenuModal::AddPath(String::new());
                     } else {
-                        // Confirm selected target
-                        let target_idx = if app.menu_selected <= routes_len {
-                            app.menu_selected
-                        } else {
-                            app.chosen_route
-                        };
+                        let target_idx = app.menu_selected;
                         app.chosen_route = target_idx;
 
                         if target_idx == 0 {
-                            // [Resume Last Session]
-                            if let Some(ref last) = app.config.last_session {
-                                let path = config::resolve_path(last);
-                                let _ = app.load_directory(&path);
+                            if let Some(last) = app.config.last_session.clone() {
+                                let path = config::resolve_path(&last);
+                                app.open_directory(&path);
+                            } else {
+                                app.set_status("No last session recorded", true);
                             }
                         } else if target_idx <= routes_len {
                             let route_idx = target_idx - 1;
-                            let r = &app.config.routes[route_idx];
-                            let path = config::resolve_path(r);
-                            let _ = app.load_directory(&path);
+                            let r = app.config.routes[route_idx].clone();
+                            let path = config::resolve_path(&r);
+                            app.open_directory(&path);
                         }
                     }
                 }
@@ -628,37 +693,36 @@ fn handle_menu_key(app: &mut App, code: KeyCode) -> Result<()> {
 // -----------------------------------------------------------------------------
 // Screen 2: Main Player Key Handling
 // -----------------------------------------------------------------------------
-fn handle_player_key(app: &mut App, code: KeyCode) -> Result<()> {
-    // If search mode is active
-    if let Some(ref mut query) = app.search_query {
+fn handle_player_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let code = key.code;
+
+    // Dedicated Search Mode handling
+    if let Some(ref mut query) = app.playlist.search_query {
         match code {
             KeyCode::Esc => {
-                app.search_query = None;
-                app.update_search_filter();
+                app.playlist.clear_search();
+                if let Some(cur) = app.playlist.current_track {
+                    app.playlist_state.select(Some(cur));
+                } else if !app.tracks.is_empty() {
+                    app.playlist_state.select(Some(0));
+                }
             }
             KeyCode::Enter => {
-                app.play_selected();
-                app.search_query = None;
+                app.confirm_search_and_play();
             }
             KeyCode::Backspace => {
                 query.pop();
-                let q_clone = query.clone();
-                app.search_query = Some(q_clone);
                 app.update_search_filter();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if is_plain_char(key.modifiers) => {
                 query.push(c);
-                let q_clone = query.clone();
-                app.search_query = Some(q_clone);
                 app.update_search_filter();
             }
-            KeyCode::Up | KeyCode::Down => {
-                // allow navigating playlist while typing search
-                if code == KeyCode::Up {
-                    select_prev_playlist(app);
-                } else {
-                    select_next_playlist(app);
-                }
+            KeyCode::Up => {
+                select_prev_playlist(app);
+            }
+            KeyCode::Down => {
+                select_next_playlist(app);
             }
             _ => {}
         }
@@ -666,17 +730,22 @@ fn handle_player_key(app: &mut App, code: KeyCode) -> Result<()> {
     }
 
     match code {
-        // Exit to Menu or Quit
         KeyCode::Esc => {
             app.screen = AppScreen::Menu;
         }
-        KeyCode::Char('q') | KeyCode::Char('Q') => {
+        KeyCode::Char('q' | 'Q') => {
             app.should_quit = true;
+        }
+        KeyCode::Char('?') => {
+            app.show_help = true;
+        }
+        KeyCode::Char('t' | 'T') => {
+            app.cycle_theme();
         }
 
         // Playback controls
         KeyCode::Char(' ') => {
-            if app.current_track_index.is_none() {
+            if app.playlist.current_track.is_none() {
                 app.play_selected();
             } else {
                 app.player.toggle_pause();
@@ -685,37 +754,41 @@ fn handle_player_key(app: &mut App, code: KeyCode) -> Result<()> {
         KeyCode::Enter => {
             app.play_selected();
         }
-        KeyCode::Char('s') | KeyCode::Char('S') => {
+        KeyCode::Char('x' | 'X') => {
+            app.stop_playback();
+            app.set_status("Playback stopped", false);
+        }
+        KeyCode::Char('s' | 'S') => {
             app.toggle_shuffle();
         }
-        KeyCode::Char('r') | KeyCode::Char('R') => {
+        KeyCode::Char('r' | 'R') => {
             app.cycle_repeat();
         }
-        KeyCode::Char('m') | KeyCode::Char('M') => {
+        KeyCode::Char('m' | 'M') => {
             app.player.toggle_mute();
         }
-        KeyCode::Char('n') => {
+        KeyCode::Char('n' | 'N') => {
             app.play_next();
         }
-        KeyCode::Char('p') | KeyCode::Char('b') => {
+        KeyCode::Char('p' | 'P' | 'b' | 'B') => {
             app.play_prev();
         }
 
         // Navigation
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k' | 'K') => {
             select_prev_playlist(app);
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j' | 'J') => {
             select_next_playlist(app);
         }
 
         // Volume
-        KeyCode::Char('+') | KeyCode::Char('=') => {
+        KeyCode::Char('+' | '=') => {
             app.player.volume_up();
             app.config.volume = (app.player.volume() * 100.0).round() as u8;
             let _ = app.config.save();
         }
-        KeyCode::Char('-') => {
+        KeyCode::Char('-' | '_') => {
             app.player.volume_down();
             app.config.volume = (app.player.volume() * 100.0).round() as u8;
             let _ = app.config.save();
@@ -723,15 +796,20 @@ fn handle_player_key(app: &mut App, code: KeyCode) -> Result<()> {
 
         // Seek forward / backward
         KeyCode::Right => {
-            app.player.seek_forward(5);
+            if let Err(err) = app.player.seek_forward(5) {
+                app.set_status(err.to_string(), true);
+            }
         }
         KeyCode::Left => {
-            app.player.seek_backward(5);
+            if let Err(err) = app.player.seek_backward(5) {
+                app.set_status(err.to_string(), true);
+            }
         }
 
         // Search trigger
         KeyCode::Char('/') => {
-            app.search_query = Some(String::new());
+            app.playlist.search_query = Some(String::new());
+            app.update_search_filter();
         }
 
         _ => {}
@@ -741,11 +819,11 @@ fn handle_player_key(app: &mut App, code: KeyCode) -> Result<()> {
 }
 
 fn select_next_playlist(app: &mut App) {
-    if app.filtered_indices.is_empty() {
+    if app.playlist.filtered_indices.is_empty() {
         return;
     }
     let cur = app.playlist_state.selected().unwrap_or(0);
-    let next = if cur + 1 >= app.filtered_indices.len() {
+    let next = if cur + 1 >= app.playlist.filtered_indices.len() {
         0
     } else {
         cur + 1
@@ -754,12 +832,12 @@ fn select_next_playlist(app: &mut App) {
 }
 
 fn select_prev_playlist(app: &mut App) {
-    if app.filtered_indices.is_empty() {
+    if app.playlist.filtered_indices.is_empty() {
         return;
     }
     let cur = app.playlist_state.selected().unwrap_or(0);
     let prev = if cur == 0 {
-        app.filtered_indices.len() - 1
+        app.playlist.filtered_indices.len() - 1
     } else {
         cur - 1
     };
@@ -770,154 +848,201 @@ fn select_prev_playlist(app: &mut App) {
 // UI Rendering
 // -----------------------------------------------------------------------------
 fn ui(f: &mut Frame, app: &mut App) {
+    let palette = ThemePalette::for_kind(app.config.theme);
+
     match app.screen {
-        AppScreen::Menu => render_menu_screen(f, app),
-        AppScreen::Player => render_player_screen(f, app),
+        AppScreen::Menu => render_menu_screen(f, app, &palette),
+        AppScreen::Player => render_player_screen(f, app, &palette),
+    }
+
+    if app.show_help {
+        render_help_modal(f, app.screen, &palette);
     }
 }
 
 // -----------------------------------------------------------------------------
-// SCREEN 1: Menu & Launcher UI (Matches Reference Image 1)
+// SCREEN 1: Menu & Launcher UI
 // -----------------------------------------------------------------------------
-fn render_menu_screen(f: &mut Frame, app: &App) {
+fn render_menu_screen(f: &mut Frame, app: &mut App, palette: &ThemePalette) {
     let size = f.area();
 
-    // Center layout
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Top margin
-            Constraint::Length(8), // ASCII Banner
+            Constraint::Length(6), // ASCII Banner
             Constraint::Length(2), // Subtitle
-            Constraint::Min(10),   // Launcher Box
-            Constraint::Length(3), // Bottom status bar
+            Constraint::Min(8),    // Launcher Box
+            Constraint::Length(1), // Status / Toast line
+            Constraint::Length(3), // Bottom controls bar
         ])
         .split(size);
 
-    // ASCII Banner for "rmp"
     let banner = vec![
-        Line::from(Span::styled(" ██████╗  ███╗   ███╗ ██████╗ ", Style::default().fg(Color::Cyan).bold())),
-        Line::from(Span::styled(" ██╔══██╗ ████╗ ████║ ██╔══██╗", Style::default().fg(Color::Cyan).bold())),
-        Line::from(Span::styled(" ██████╔╝ ██╔████╔██║ ██████╔╝", Style::default().fg(Color::Cyan).bold())),
-        Line::from(Span::styled(" ██╔══██╗ ██║╚██╔╝██║ ██╔═══╝ ", Style::default().fg(Color::Cyan).bold())),
-        Line::from(Span::styled(" ██║  ██║ ██║ ╚═╝ ██║ ██║     ", Style::default().fg(Color::Cyan).bold())),
-        Line::from(Span::styled(" ╚═╝  ╚═╝ ╚═╝     ╚═╝ ╚═╝     ", Style::default().fg(Color::Cyan).bold())),
+        Line::from(Span::styled(
+            " ██████╗  ███╗   ███╗ ██████╗ ",
+            Style::default().fg(palette.accent_bright).bold(),
+        )),
+        Line::from(Span::styled(
+            " ██╔══██╗ ████╗ ████║ ██╔══██╗",
+            Style::default().fg(palette.accent_bright).bold(),
+        )),
+        Line::from(Span::styled(
+            " ██████╔╝ ██╔████╔██║ ██████╔╝",
+            Style::default().fg(palette.accent).bold(),
+        )),
+        Line::from(Span::styled(
+            " ██╔══██╗ ██║╚██╔╝██║ ██╔═══╝ ",
+            Style::default().fg(palette.accent).bold(),
+        )),
+        Line::from(Span::styled(
+            " ██║  ██║ ██║ ╚═╝ ██║ ██║     ",
+            Style::default().fg(palette.border).bold(),
+        )),
+        Line::from(Span::styled(
+            " ╚═╝  ╚═╝ ╚═╝     ╚═╝ ╚═╝     ",
+            Style::default().fg(palette.border).bold(),
+        )),
     ];
-    let banner_widget = Paragraph::new(banner).alignment(Alignment::Center);
-    f.render_widget(banner_widget, chunks[1]);
+    f.render_widget(Paragraph::new(banner).alignment(Alignment::Center), chunks[1]);
 
-    // Subtitle
     let subtitle = Paragraph::new(Line::from(vec![
-        Span::styled("♫ Rust Music Player v1.4.0 ♫", Style::default().fg(Color::Cyan).italic()),
+        Span::styled(
+            "♫ Rust Music Player  •  ",
+            Style::default().fg(palette.accent).italic(),
+        ),
+        Span::styled(
+            format!("[THEME: {}]", app.config.theme.label()),
+            Style::default().fg(palette.badge_special).bold(),
+        ),
+        Span::styled(" ♫", Style::default().fg(palette.accent).italic()),
     ]))
     .alignment(Alignment::Center);
     f.render_widget(subtitle, chunks[2]);
 
-    // Center Launcher Box (Fixed width ~52, centered horizontally)
+    let box_width = size.width.saturating_sub(4).clamp(36, 68);
     let center_h = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(50),
-            Constraint::Percentage(25),
+            Constraint::Min(0),
+            Constraint::Length(box_width),
+            Constraint::Min(0),
         ])
         .split(chunks[3]);
 
     let launcher_area = center_h[1];
 
-    let mut items = Vec::new();
+    struct MenuEntry {
+        label: String,
+        exists: Option<bool>,
+    }
 
-    // 0: Resume Last Session
-    let last_str = app
+    let mut entries = Vec::new();
+    let last_raw = app
         .config
         .last_session
         .as_deref()
-        .map(|s| config::display_path(Path::new(s)))
-        .unwrap_or_else(|| "~/Music".to_string());
-    items.push(format!("[Resume Last Session] ({})", last_str));
+        .unwrap_or("~/Music");
+    let last_resolved = config::resolve_path(last_raw);
+    entries.push(MenuEntry {
+        label: format!("[Resume Last Session] ({})", config::display_path(Path::new(last_raw))),
+        exists: Some(last_resolved.is_dir()),
+    });
 
-    // Routes
     for (i, r) in app.config.routes.iter().enumerate() {
-        items.push(format!("[{}] {}", i + 1, r));
+        let resolved = config::resolve_path(r);
+        entries.push(MenuEntry {
+            label: format!("[{}] {}", i + 1, r),
+            exists: Some(resolved.is_dir()),
+        });
     }
 
-    // Browse and Add options
-    items.push("[B] Browse File System...".to_string());
-    items.push("[A] Add New Custom Path...".to_string());
+    entries.push(MenuEntry {
+        label: "[B] Browse File System...".to_string(),
+        exists: None,
+    });
+    entries.push(MenuEntry {
+        label: "[A] Add New Custom Path...".to_string(),
+        exists: None,
+    });
 
-    let list_items: Vec<ListItem> = items
+    let inner_w = launcher_area.width.saturating_sub(4) as usize;
+    let list_items: Vec<ListItem> = entries
         .iter()
         .enumerate()
-        .map(|(idx, text)| {
+        .map(|(idx, entry)| {
             let is_focused = app.menu_selected == idx;
             let is_chosen = app.chosen_route == idx && idx <= app.config.routes.len();
 
-            let radio = if is_chosen { "● " } else { "○ " };
-            let prefix = if is_focused { "> " } else { "  " };
-
+            let prefix = if is_focused { "▶ " } else { "  " };
             let mark = if idx <= app.config.routes.len() {
-                radio
+                if is_chosen { "● " } else { "○ " }
             } else {
                 "  "
             };
+            let status_tag = match entry.exists {
+                Some(true) => " ✓",
+                Some(false) => " ✗",
+                None => "",
+            };
+            let max_label_w = inner_w.saturating_sub(4 + status_tag.chars().count());
+            let label = truncate_chars(&entry.label, max_label_w);
 
-            let line = Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Yellow).bold()),
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(palette.badge_warn).bold()),
                 Span::styled(
                     mark,
                     if is_chosen {
-                        Style::default().fg(Color::Cyan).bold()
+                        Style::default().fg(palette.accent).bold()
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(palette.text_muted)
                     },
                 ),
                 Span::styled(
-                    text,
+                    label,
                     if is_focused {
-                        Style::default().fg(Color::White).bold()
+                        Style::default().fg(palette.text_primary).bold()
                     } else if is_chosen {
-                        Style::default().fg(Color::Cyan)
+                        Style::default().fg(palette.accent)
                     } else {
-                        Style::default().fg(Color::Rgb(180, 210, 230))
+                        Style::default().fg(palette.text_secondary)
                     },
                 ),
-            ]);
+            ];
 
+            if let Some(ok) = entry.exists {
+                spans.push(Span::styled(
+                    status_tag,
+                    Style::default().fg(if ok {
+                        palette.badge_ok
+                    } else {
+                        palette.badge_err
+                    }),
+                ));
+            }
+
+            let line = Line::from(spans);
             if is_focused {
-                ListItem::new(line).style(Style::default().bg(Color::Rgb(15, 65, 120)))
+                ListItem::new(line).style(Style::default().bg(palette.highlight_bg))
             } else {
                 ListItem::new(line)
             }
         })
         .collect();
 
-    let launcher_box = List::new(list_items)
-        .block(
-            Block::default()
-                .title(" LAUNCHER / SELECT PATH ")
-                .title_alignment(Alignment::Center)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Rgb(120, 180, 200))),
-        );
-
+    let launcher_box = List::new(list_items).block(
+        Block::default()
+            .title(" ◈ LAUNCHER / SELECT PATH ◈ ")
+            .title_alignment(Alignment::Center)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(palette.border)),
+    );
     f.render_widget(launcher_box, launcher_area);
 
-    // Bottom Bar (Separating [Space] Select and [Enter] Confirm)
-    let bottom_text = Line::from(vec![
-        Span::styled("[Space]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Select  "),
-        Span::styled("[Enter]", Style::default().fg(Color::Green).bold()),
-        Span::raw(" Confirm  "),
-        Span::styled("[B]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Browse Folder  "),
-        Span::styled("[A]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Add Route  "),
-        Span::styled("[D]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Delete Route  "),
-        Span::styled("[Q]", Style::default().fg(Color::Red).bold()),
-        Span::raw(" Quit"),
-    ]);
+    render_status_strip(f, app, chunks[4], palette, "Select a music folder or press [1-9]");
+
+    let bottom_text = menu_bottom_bar_line(chunks[5].width.saturating_sub(2), palette);
 
     let bottom_box = Paragraph::new(bottom_text)
         .alignment(Alignment::Center)
@@ -925,438 +1050,813 @@ fn render_menu_screen(f: &mut Frame, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(palette.border_dim)),
         );
-    f.render_widget(bottom_box, chunks[4]);
+    f.render_widget(bottom_box, chunks[5]);
 
-    // Modals
-    match &app.menu_modal {
-        MenuModal::Browse(ref browse) => render_browse_modal(f, browse, size),
-        MenuModal::AddPath(ref input) => render_add_path_modal(f, input, size),
+    match &mut app.menu_modal {
+        MenuModal::Browse(ref mut browse) => render_browse_modal(f, browse, size, palette),
+        MenuModal::AddPath(ref input) => render_add_path_modal(f, input, size, palette),
         MenuModal::None => {}
     }
 }
 
-fn render_browse_modal(f: &mut Frame, browse: &BrowseState, area: Rect) {
-    let popup_area = centered_rect(65, 70, area);
+fn render_browse_modal(
+    f: &mut Frame,
+    browse: &mut BrowseState,
+    area: Rect,
+    palette: &ThemePalette,
+) {
+    let popup_area = centered_rect(70, 75, area);
     f.render_widget(Clear, popup_area);
 
     let mut items = vec![
-        ListItem::new(Line::from(vec![
-            Span::styled("  ✓ [Confirm & Open Current Folder]", Style::default().fg(Color::Green).bold()),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("  .. (Parent Folder)", Style::default().fg(Color::Yellow).bold()),
-        ])),
+        ListItem::new(Line::from(vec![Span::styled(
+            "  ✓ [Confirm & Open Current Folder]",
+            Style::default().fg(palette.badge_ok).bold(),
+        )])),
+        ListItem::new(Line::from(vec![Span::styled(
+            "  .. (Parent Folder)",
+            Style::default().fg(palette.badge_warn).bold(),
+        )])),
     ];
 
     for entry in &browse.entries {
-        let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or("folder");
-        let line = Line::from(vec![
-            Span::styled("  📁 ", Style::default().fg(Color::Cyan)),
-            Span::raw(name),
-        ]);
-        items.push(ListItem::new(line));
+        let name = entry
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("folder");
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("  ▸ ", Style::default().fg(palette.accent)),
+            Span::styled(name, Style::default().fg(palette.text_secondary)),
+        ])));
     }
 
-    let mut list_state = ListState::default();
-    list_state.select(Some(browse.selected));
-
+    let title_path = truncate_chars(
+        &browse.current_dir.display().to_string(),
+        popup_area.width.saturating_sub(36) as usize,
+    );
     let block = Block::default()
-        .title(format!(" 📁 Browse: {} ([Space] Select | [Enter] Open/Confirm) ", browse.current_dir.display()))
+        .title(format!(
+            " Browse: {} ([Space] Open | [Enter] Step) ",
+            title_path
+        ))
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(palette.border));
 
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::Rgb(20, 80, 140)).fg(Color::White).bold())
+        .highlight_style(
+            Style::default()
+                .bg(palette.highlight_bg)
+                .fg(palette.text_primary)
+                .bold(),
+        )
         .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(list, popup_area, &mut list_state);
+    f.render_stateful_widget(list, popup_area, &mut browse.list_state);
 }
 
-fn render_add_path_modal(f: &mut Frame, input: &str, area: Rect) {
-    let popup_area = centered_rect(50, 20, area);
+fn render_add_path_modal(f: &mut Frame, input: &str, area: Rect, palette: &ThemePalette) {
+    let popup_area = centered_fixed_rect(area.width.saturating_sub(6).clamp(32, 64), 7, area);
     f.render_widget(Clear, popup_area);
 
     let text = vec![
-        Line::from(Span::styled("Enter Directory Path:", Style::default().fg(Color::White).bold())),
+        Line::from(Span::styled(
+            "Enter Directory Path (supports ~):",
+            Style::default().fg(palette.text_primary).bold(),
+        )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!(" > {}_", input), Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" > ", Style::default().fg(palette.badge_warn).bold()),
+            Span::styled(input, Style::default().fg(palette.accent_bright).bold()),
+            Span::styled("█", Style::default().fg(palette.badge_warn)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("[Enter] Save & Add  |  [Esc] Cancel", Style::default().fg(Color::DarkGray)),
-        ]),
+        Line::from(Span::styled(
+            "[Enter] Save & Add  |  [Esc] Cancel",
+            Style::default().fg(palette.text_muted),
+        )),
     ];
 
     let block = Block::default()
-        .title(" ➕ Add Custom Path ")
+        .title(" + Add Custom Path ")
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(palette.badge_warn));
 
     f.render_widget(Paragraph::new(text).block(block), popup_area);
 }
 
 // -----------------------------------------------------------------------------
-// SCREEN 2: Main Music Player UI (Matches Reference Image 2)
+// SCREEN 2: Main Music Player UI
 // -----------------------------------------------------------------------------
-fn render_player_screen(f: &mut Frame, app: &mut App) {
+fn render_player_screen(f: &mut Frame, app: &mut App, palette: &ThemePalette) {
     let size = f.area();
 
-    // Vertical layout: Top Status Bar (1), Main Body (Min), Bottom Help (3)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Top Status Bar
             Constraint::Min(12),   // Main 2-column layout
+            Constraint::Length(1), // Status / Ticker Strip
             Constraint::Length(3), // Bottom Controls & Help
         ])
         .split(size);
 
-    // 1. TOP STATUS BAR (Matches Image 2 exactly)
-    render_top_status_bar(f, app, chunks[0]);
+    render_top_status_bar(f, app, chunks[0], palette);
 
-    // 2. MAIN BODY (50% Left Playlist | 50% Right Player & Visualizer)
     let body_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(50), // Left: Tracks & Playlist
-            Constraint::Percentage(50), // Right: Now Playing & Live Visualizer
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
         ])
         .split(chunks[1]);
 
-    // Left Column: Tracks & Playlist
-    render_playlist_pane(f, app, body_cols[0]);
+    render_playlist_pane(f, app, body_cols[0], palette);
 
-    // Right Column: Now Playing (Top) + Spectrum Visualizer (Bottom)
     let right_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(14), // Now Playing & Vinyl
-            Constraint::Min(6),     // Live Spectrum Visualizer
+            Constraint::Length(now_playing_height(body_cols[1].height)),
+            Constraint::Min(6),
         ])
         .split(body_cols[1]);
 
-    render_now_playing_pane(f, app, right_rows[0]);
-    render_spectrum_pane(f, app, right_rows[1]);
+    render_now_playing_pane(f, app, right_rows[0], palette);
+    render_spectrum_pane(f, app, right_rows[1], palette);
 
-    // 3. BOTTOM CONTROLS & HELP BAR (Matches Image 2)
-    render_player_bottom_bar(f, app, chunks[2]);
+    let fallback_info = if app.current_dir_display.is_empty() {
+        format!("{} tracks loaded", app.tracks.len())
+    } else {
+        format!("{}  •  {} tracks", app.current_dir_display, app.tracks.len())
+    };
+    render_status_strip(f, app, chunks[2], palette, &fallback_info);
+    render_player_bottom_bar(f, chunks[3], palette);
 }
 
-fn render_top_status_bar(f: &mut Frame, app: &App, area: Rect) {
+fn render_status_strip(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    palette: &ThemePalette,
+    fallback: &str,
+) {
+    let line = if let Some(banner) = app.active_status() {
+        let (tag, color) = if banner.is_error {
+            (" [ERR] ", palette.badge_err)
+        } else {
+            (" [INFO] ", palette.badge_ok)
+        };
+        Line::from(vec![
+            Span::styled(tag, Style::default().fg(color).bold()),
+            Span::styled(&banner.text, Style::default().fg(color)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" ◈ ", Style::default().fg(palette.text_muted)),
+            Span::styled(fallback, Style::default().fg(palette.text_muted)),
+        ])
+    };
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn render_top_status_bar(f: &mut Frame, app: &App, area: Rect, palette: &ThemePalette) {
     let vol_pct = (app.player.volume() * 100.0).round() as u8;
-    let muted_str = if app.player.is_muted() { "YES" } else { "NO" };
-    let shuffle_str = if app.shuffle { "ON" } else { "OFF" };
-    let repeat_str = app.repeat.as_str();
+    let muted = app.player.is_muted();
+    let muted_str = if muted { "YES" } else { "NO" };
+    let shuffle_str = if app.playlist.shuffle { "ON" } else { "OFF" };
+    let repeat_str = app.playlist.repeat.as_str();
+
+    let center_line = Line::from(vec![
+        Span::styled("♫ rmp DECK ", Style::default().fg(palette.accent_bright).bold()),
+        Span::styled(
+            format!("[{}]", app.config.theme.label()),
+            Style::default().fg(palette.badge_special).bold(),
+        ),
+        Span::styled(" ♫", Style::default().fg(palette.accent_bright).bold()),
+    ]);
+
+    let compact = area.width < 76;
+    let left_line = if compact {
+        let mut spans = vec![Span::styled(
+            format!("[V:{}%]", vol_pct),
+            Style::default().fg(palette.accent).bold(),
+        )];
+        if muted {
+            spans.push(Span::styled(" [M]", Style::default().fg(palette.badge_warn).bold()));
+        }
+        Line::from(spans)
+    } else {
+        Line::from(vec![
+            Span::styled(
+                format!("[VOL: {}%] ", vol_pct),
+                Style::default().fg(palette.accent).bold(),
+            ),
+            Span::styled(
+                format!("[MUTED: {}]", muted_str),
+                if muted {
+                    Style::default().fg(palette.badge_warn).bold()
+                } else {
+                    Style::default().fg(palette.text_muted)
+                },
+            ),
+        ])
+    };
+
+    let repeat_style = match app.playlist.repeat {
+        RepeatMode::Off => Style::default().fg(palette.text_muted),
+        RepeatMode::One => Style::default().fg(palette.badge_warn).bold(),
+        RepeatMode::Once => Style::default().fg(palette.badge_special).bold(),
+        RepeatMode::All => Style::default().fg(palette.accent).bold(),
+    };
+    let shuffle_style = if app.playlist.shuffle {
+        Style::default().fg(palette.accent).bold()
+    } else {
+        Style::default().fg(palette.text_muted)
+    };
+
+    let right_line = if compact {
+        Line::from(vec![
+            Span::styled(format!("[SHF:{}] ", shuffle_str), shuffle_style),
+            Span::styled(format!("[REP:{}]", repeat_str), repeat_style),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(format!("[SHUFFLE: {}] ", shuffle_str), shuffle_style),
+            Span::styled(format!("[REPEAT: {}]", repeat_str), repeat_style),
+        ])
+    };
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25), // Left: [VOL: XX%] [MUTED: NO]
-            Constraint::Percentage(50), // Center: ♫ rmp - RUST MUSIC PLAYER v1.4.0 ♫
-            Constraint::Percentage(25), // Right: [SHUFFLE: ON] [REPEAT: ALL]
-        ])
+        .constraints(top_bar_constraints(
+            area.width,
+            left_line.width() as u16,
+            right_line.width() as u16,
+        ))
         .split(area);
 
-    // Left status
-    let left_line = Line::from(vec![
-        Span::styled(format!("[VOL: {}%] ", vol_pct), Style::default().fg(Color::Cyan).bold()),
-        Span::styled(format!("[MUTED: {}]", muted_str), if app.player.is_muted() {
-            Style::default().fg(Color::Yellow).bold()
-        } else {
-            Style::default().fg(Color::Cyan).bold()
-        }),
-    ]);
     f.render_widget(Paragraph::new(left_line).alignment(Alignment::Left), cols[0]);
-
-    // Center title
-    let center_line = Line::from(vec![
-        Span::styled("♫ rmp - RUST MUSIC PLAYER v1.4.0 ♫", Style::default().fg(Color::Cyan).bold()),
-    ]);
     f.render_widget(Paragraph::new(center_line).alignment(Alignment::Center), cols[1]);
-
-    // Right status
-    let right_line = Line::from(vec![
-        Span::styled(format!("[SHUFFLE: {}] ", shuffle_str), if app.shuffle {
-            Style::default().fg(Color::Cyan).bold()
-        } else {
-            Style::default().fg(Color::DarkGray)
-        }),
-        Span::styled(format!("[REPEAT: {}]", repeat_str), match app.repeat {
-            RepeatMode::Off => Style::default().fg(Color::DarkGray),
-            RepeatMode::One => Style::default().fg(Color::Yellow).bold(),
-            RepeatMode::All => Style::default().fg(Color::Cyan).bold(),
-        }),
-    ]);
     f.render_widget(Paragraph::new(right_line).alignment(Alignment::Right), cols[2]);
 }
 
-fn render_playlist_pane(f: &mut Frame, app: &mut App, area: Rect) {
-    let search_indicator = if let Some(ref q) = app.search_query {
-        format!(" (Filter: \"{}\")", q)
+fn render_playlist_pane(f: &mut Frame, app: &mut App, area: Rect, palette: &ThemePalette) {
+    let search_active = app.playlist.search_query.is_some();
+    let (list_area, search_area) = if search_active {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .split(area);
+        (split[0], Some(split[1]))
     } else {
-        String::new()
+        (area, None)
     };
 
-    let title = format!(" TRACKS & PLAYLIST{} ", search_indicator);
+    let title = if search_active {
+        format!(
+            " TRACKS & PLAYLIST ({} matches) ",
+            app.playlist.filtered_indices.len()
+        )
+    } else {
+        format!(" TRACKS & PLAYLIST ({}) ", app.tracks.len())
+    };
 
     let block = Block::default()
         .title(title)
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(if search_active {
+            palette.border_dim
+        } else {
+            palette.border
+        }));
 
-    let inner_width = area.width.saturating_sub(4) as usize;
-
+    let inner_width = list_area.width.saturating_sub(4) as usize;
     let items: Vec<ListItem> = app
+        .playlist
         .filtered_indices
         .iter()
         .enumerate()
         .map(|(display_idx, &track_idx)| {
             let track = &app.tracks[track_idx];
-            let is_current = app.current_track_index == Some(track_idx);
+            let is_current = app.playlist.current_track == Some(track_idx);
 
             let prefix = if is_current { "▶ " } else { "  " };
+            let prefix_cols = 2usize;
             let num = format!("{:02}. ", display_idx + 1);
+            let num_cols = num.chars().count();
 
-            let name = if track.artist != "Unknown Artist" {
+            let raw_name = if track.artist != "Unknown Artist" {
                 format!("{} - {}", track.title, track.artist)
             } else {
                 track.file_name.clone()
             };
 
             let dur_str = track.formatted_duration();
+            let dur_cols = dur_str.chars().count();
 
-            // Right-align duration
-            let left_part_len = prefix.len() + num.len() + name.chars().count();
-            let pad = if inner_width > left_part_len + dur_str.len() {
-                " ".repeat(inner_width - left_part_len - dur_str.len())
-            } else {
-                " ".to_string()
-            };
+            let max_name_cols = inner_width.saturating_sub(prefix_cols + num_cols + dur_cols + 1);
+            let name = truncate_chars(&raw_name, max_name_cols);
+            let name_cols = name.chars().count();
+
+            let used = prefix_cols + num_cols + name_cols + dur_cols;
+            let pad = " ".repeat(inner_width.saturating_sub(used).max(1));
 
             let line = Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Cyan).bold()),
-                Span::styled(num, Style::default().fg(Color::DarkGray)),
-                Span::styled(name, if is_current {
-                    Style::default().fg(Color::White).bold()
-                } else {
-                    Style::default().fg(Color::Rgb(210, 230, 245))
-                }),
+                Span::styled(prefix, Style::default().fg(palette.accent_bright).bold()),
+                Span::styled(num, Style::default().fg(palette.text_muted)),
+                Span::styled(
+                    name,
+                    if is_current {
+                        Style::default().fg(palette.text_primary).bold()
+                    } else {
+                        Style::default().fg(palette.text_secondary)
+                    },
+                ),
                 Span::raw(pad),
-                Span::styled(dur_str, Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    dur_str,
+                    Style::default().fg(if is_current {
+                        palette.accent
+                    } else {
+                        palette.text_muted
+                    }),
+                ),
             ]);
 
             ListItem::new(line)
         })
         .collect();
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(20, 85, 150))
-                .fg(Color::White)
-                .bold(),
-        );
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(palette.highlight_bg)
+            .fg(palette.text_primary)
+            .bold(),
+    );
 
-    f.render_stateful_widget(list, area, &mut app.playlist_state);
+    f.render_stateful_widget(list, list_area, &mut app.playlist_state);
+
+    if let (Some(s_area), Some(ref query)) = (search_area, &app.playlist.search_query) {
+        let search_line = Line::from(vec![
+            Span::styled(" SEARCH: ", Style::default().fg(palette.badge_warn).bold()),
+            Span::styled(query.as_str(), Style::default().fg(palette.text_primary).bold()),
+            Span::styled("█", Style::default().fg(palette.badge_warn)),
+        ]);
+        let search_block = Block::default()
+            .title(" FILTER MODE ([Enter] Play & Clear | [Esc] Cancel) ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(palette.badge_warn));
+        f.render_widget(Paragraph::new(search_line).block(search_block), s_area);
+    }
 }
 
-fn render_now_playing_pane(f: &mut Frame, app: &App, area: Rect) {
+fn render_now_playing_pane(f: &mut Frame, app: &App, area: Rect, palette: &ThemePalette) {
     let block = Block::default()
         .title(" NOW PLAYING ")
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(palette.border));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Split inner horizontally: Left (Details & Progress) | Right (Vinyl Disc)
+    let vinyl_col_w = if inner.width >= 48 { 21 } else { 17 };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(24),   // Metadata & Controls
-            Constraint::Length(18), // Vinyl Disc Widget
-        ])
+        .constraints([Constraint::Min(22), Constraint::Length(vinyl_col_w)])
         .split(inner);
 
-    let (artist, album, title, genre, format_str) = match app.current_track_index {
+    let (artist, album, title, genre, format_str) = match app.playlist.current_track {
         Some(idx) => {
             let t = &app.tracks[idx];
-            (&t.artist, &t.album, &t.title, &t.genre, &t.format_str)
+            (
+                t.artist.as_str(),
+                t.album.as_str(),
+                t.title.as_str(),
+                t.genre.as_str(),
+                t.format_str.as_str(),
+            )
         }
-        None => (
-            &"None (Stopped)".to_string(),
-            &"-".to_string(),
-            &"-".to_string(),
-            &"-".to_string(),
-            &"-".to_string(),
-        ),
+        None => ("None (Stopped)", "-", "-", "-", "-"),
     };
 
-    let elapsed = app.player.elapsed();
-    let total = app.player.total_duration().unwrap_or_else(|| {
-        app.current_track_index
-            .and_then(|idx| app.tracks[idx].duration)
-            .unwrap_or(Duration::from_secs(180))
-    });
+    let meta_max = cols[0].width.saturating_sub(9) as usize;
 
-    let elapsed_secs = elapsed.as_secs();
-    let total_secs = total.as_secs().max(1);
-    let pct = (elapsed_secs as f64 / total_secs as f64).clamp(0.0, 1.0);
+    let has_track = app.playlist.current_track.is_some();
+    let elapsed_secs = if has_track {
+        app.player.elapsed().as_secs()
+    } else {
+        0
+    };
+    let total_dur = if has_track {
+        app.player.total_duration().or_else(|| {
+            app.playlist
+                .current_track
+                .and_then(|idx| app.tracks[idx].duration)
+        })
+    } else {
+        None
+    };
 
-    // Metadata lines
+    let (pct, time_display) = match total_dur {
+        Some(tot) if tot.as_secs() > 0 => {
+            let t_secs = tot.as_secs();
+            let p = (elapsed_secs as f64 / t_secs as f64).clamp(0.0, 1.0);
+            (
+                p,
+                format!(
+                    "{} / {}",
+                    format_duration_secs(elapsed_secs),
+                    format_duration_secs(t_secs)
+                ),
+            )
+        }
+        _ if has_track => (0.0, format!("{} / --:--", format_duration_secs(elapsed_secs))),
+        _ => (0.0, "--:-- / --:--".to_string()),
+    };
+
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("ARTIST: ", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(artist, Style::default().fg(Color::White)),
+            Span::styled("ARTIST: ", Style::default().fg(palette.accent).bold()),
+            Span::styled(
+                truncate_chars(artist, meta_max),
+                Style::default().fg(palette.text_primary),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("ALBUM:  ", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(album, Style::default().fg(Color::White)),
+            Span::styled("ALBUM:  ", Style::default().fg(palette.accent).bold()),
+            Span::styled(
+                truncate_chars(album, meta_max),
+                Style::default().fg(palette.text_secondary),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("TITLE:  ", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(title, Style::default().fg(Color::White).bold()),
+            Span::styled("TITLE:  ", Style::default().fg(palette.accent).bold()),
+            Span::styled(
+                truncate_chars(title, meta_max),
+                Style::default().fg(palette.accent_bright).bold(),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("GENRE:  ", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(genre, Style::default().fg(Color::White)),
+            Span::styled("GENRE:  ", Style::default().fg(palette.accent).bold()),
+            Span::styled(
+                truncate_chars(genre, meta_max),
+                Style::default().fg(palette.text_secondary),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("FORMAT: ", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(format_str, Style::default().fg(Color::Rgb(140, 200, 220))),
+            Span::styled("FORMAT: ", Style::default().fg(palette.accent).bold()),
+            Span::styled(
+                truncate_chars(format_str, meta_max),
+                Style::default().fg(palette.text_muted),
+            ),
         ]),
         Line::from(""),
     ];
 
-    // Transport buttons: |<<  ■  ▶  ||  >>|
+    // Retro Hi-Fi Transport Bar
     let is_paused = app.player.is_paused();
-    let is_playing = app.current_track_index.is_some() && !is_paused;
+    let is_playing = has_track && !is_paused;
 
     let transport_line = Line::from(vec![
-        Span::styled(" |<<  ", Style::default().fg(Color::Cyan)),
-        Span::styled(" ■ ", if app.current_track_index.is_none() {
-            Style::default().fg(Color::Red).bold()
-        } else {
-            Style::default().fg(Color::DarkGray)
-        }),
-        Span::styled(" ▶ ", if is_playing {
-            Style::default().fg(Color::Green).bold()
-        } else {
-            Style::default().fg(Color::DarkGray)
-        }),
-        Span::styled(" || ", if is_paused {
-            Style::default().fg(Color::Yellow).bold()
-        } else {
-            Style::default().fg(Color::DarkGray)
-        }),
-        Span::styled(" >>|", Style::default().fg(Color::Cyan)),
+        Span::styled(" |<< ", Style::default().fg(palette.accent)),
+        Span::raw(" "),
+        Span::styled(
+            " ■ ",
+            if !has_track {
+                Style::default()
+                    .bg(palette.badge_err)
+                    .fg(palette.text_primary)
+                    .bold()
+            } else {
+                Style::default().fg(palette.text_muted)
+            },
+        ),
+        Span::raw(" "),
+        Span::styled(
+            " ▶ ",
+            if is_playing {
+                Style::default()
+                    .bg(palette.badge_ok)
+                    .fg(palette.vinyl_hole)
+                    .bold()
+            } else {
+                Style::default().fg(palette.text_muted)
+            },
+        ),
+        Span::raw(" "),
+        Span::styled(
+            " || ",
+            if has_track && is_paused {
+                Style::default()
+                    .bg(palette.badge_warn)
+                    .fg(palette.vinyl_hole)
+                    .bold()
+            } else {
+                Style::default().fg(palette.text_muted)
+            },
+        ),
+        Span::raw(" "),
+        Span::styled(" >>| ", Style::default().fg(palette.accent)),
     ]);
     lines.push(transport_line);
 
-    // Custom Progress Bar: [████████░░░░░░░░] 01:45 / 03:20
-    let bar_width = (cols[0].width.saturating_sub(18) as usize).clamp(10, 30);
+    // Multi-tone Retro Progress Bar with Playhead Marker ◆
+    let bar_width = progress_bar_width(cols[0].width, time_display.chars().count());
     let filled = ((pct * bar_width as f64).round() as usize).min(bar_width);
-    let unfilled = bar_width.saturating_sub(filled);
+    let head = if has_track && bar_width > 0 { 1 } else { 0 };
+    let played_len = filled.saturating_sub(head);
+    let remain_len = bar_width.saturating_sub(played_len + head);
 
-    let progress_bar = format!(
-        "[{}{}]  {} / {}",
-        "█".repeat(filled),
-        "░".repeat(unfilled),
-        format_duration_secs(elapsed_secs),
-        format_duration_secs(total_secs)
-    );
+    let mut bar_spans = vec![
+        Span::styled("[", Style::default().fg(palette.border_dim)),
+        Span::styled("━".repeat(played_len), Style::default().fg(palette.accent)),
+    ];
+    if head > 0 {
+        bar_spans.push(Span::styled(
+            "◆",
+            Style::default().fg(palette.accent_bright).bold(),
+        ));
+    }
+    bar_spans.push(Span::styled(
+        "─".repeat(remain_len),
+        Style::default().fg(palette.border_dim),
+    ));
+    bar_spans.push(Span::styled("] ", Style::default().fg(palette.border_dim)));
+    bar_spans.push(Span::styled(
+        time_display.clone(),
+        Style::default().fg(palette.text_secondary),
+    ));
+    lines.push(Line::from(bar_spans));
 
-    lines.push(Line::from(vec![
-        Span::styled(progress_bar, Style::default().fg(Color::Cyan)),
-    ]));
+    f.render_widget(Paragraph::new(lines), cols[0]);
 
-    let details_p = Paragraph::new(lines);
-    f.render_widget(details_p, cols[0]);
-
-    // Right Column: Spinning Vinyl Record Widget!
     let vinyl_box = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8), // Vinyl Disc height
-            Constraint::Length(2), // Time indicator below vinyl
-        ])
+        .constraints([Constraint::Length(8), Constraint::Length(2)])
         .split(cols[1]);
 
-    let vinyl = VinylRecord::new(is_playing, app.frame_counter);
+    let vinyl = VinylRecord::new(is_playing, app.frame_counter, palette);
     f.render_widget(vinyl, vinyl_box[0]);
 
-    let vinyl_time = Line::from(vec![
-        Span::styled(
-            format!("{} / {}", format_duration_secs(elapsed_secs), format_duration_secs(total_secs)),
-            Style::default().fg(Color::Rgb(160, 200, 220)).bold(),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(vinyl_time).alignment(Alignment::Center), vinyl_box[1]);
+    let vinyl_time = Line::from(vec![Span::styled(
+        time_display,
+        Style::default().fg(palette.accent).bold(),
+    )]);
+    f.render_widget(
+        Paragraph::new(vinyl_time).alignment(Alignment::Center),
+        vinyl_box[1],
+    );
 }
 
-fn render_spectrum_pane(f: &mut Frame, app: &App, area: Rect) {
+fn render_spectrum_pane(f: &mut Frame, app: &App, area: Rect, palette: &ThemePalette) {
     let block = Block::default()
         .title(" LIVE SPECTRUM VISUALIZER ")
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(palette.border));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let visualizer = SpectrumVisualizer::new(&app.spectrum);
+    let visualizer = SpectrumVisualizer::new(&app.spectrum, palette);
     f.render_widget(visualizer, inner);
 }
 
-fn render_player_bottom_bar(f: &mut Frame, _app: &App, area: Rect) {
-    let text = Line::from(vec![
-        Span::styled("[Space]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Play/Pause | "),
-        Span::styled("[n]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Next | "),
-        Span::styled("[p]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Prev | "),
-        Span::styled("[→/←]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Seek | "),
-        Span::styled("[+/-]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Vol | "),
-        Span::styled("[s]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Shuffle | "),
-        Span::styled("[r]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Repeat | "),
-        Span::styled("[m]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Mute | "),
-        Span::styled("[/]", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(" Search | "),
-        Span::styled("[Esc]", Style::default().fg(Color::Yellow).bold()),
-        Span::raw(" Back to Menu | "),
-        Span::styled("[Q]", Style::default().fg(Color::Red).bold()),
-        Span::raw(" Quit"),
-    ]);
+fn render_player_bottom_bar(f: &mut Frame, area: Rect, palette: &ThemePalette) {
+    let text = player_bottom_bar_line(area.width.saturating_sub(2), palette);
 
     let block = Block::default()
-        .title(" CONTROLS & HELP ")
+        .title(" CONTROLS ")
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(palette.border_dim));
 
-    f.render_widget(Paragraph::new(text).alignment(Alignment::Center).block(block), area);
+    f.render_widget(
+        Paragraph::new(text).alignment(Alignment::Center).block(block),
+        area,
+    );
 }
 
-/// Helper function to create a centered popup area
+fn now_playing_height(body_height: u16) -> u16 {
+    if body_height < 20 { 12 } else { 14 }
+}
+
+fn progress_bar_width(col_width: u16, time_display_chars: usize) -> usize {
+    (col_width as usize)
+        .saturating_sub(3 + time_display_chars)
+        .min(30)
+}
+
+fn top_bar_constraints(area_width: u16, left_chars: u16, right_chars: u16) -> [Constraint; 3] {
+    let side = left_chars.max(right_chars);
+    if area_width >= side.saturating_mul(2).saturating_add(22) {
+        [
+            Constraint::Length(side),
+            Constraint::Min(0),
+            Constraint::Length(side),
+        ]
+    } else {
+        [
+            Constraint::Length(left_chars),
+            Constraint::Min(0),
+            Constraint::Length(right_chars),
+        ]
+    }
+}
+
+type HotkeyItem = (&'static str, &'static str, Color);
+type HotkeyTier<'a> = (&'a [HotkeyItem], &'static str);
+
+fn build_hotkey_line(items: &[HotkeyItem], sep: &'static str) -> Line<'static> {
+    let mut spans = Vec::with_capacity(items.len() * 3);
+    for (idx, &(key, label, color)) in items.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(sep));
+        }
+        spans.push(Span::styled(key, Style::default().fg(color).bold()));
+        if !label.is_empty() {
+            spans.push(Span::raw(" "));
+            spans.push(Span::raw(label));
+        }
+    }
+    Line::from(spans)
+}
+
+fn pick_fitting_hotkey_line(tiers: &[HotkeyTier<'_>], max_width: u16) -> Line<'static> {
+    for &(items, sep) in tiers {
+        let line = build_hotkey_line(items, sep);
+        if line.width() <= max_width as usize {
+            return line;
+        }
+    }
+    let &(items, sep) = tiers.last().expect("at least one hotkey tier");
+    build_hotkey_line(items, sep)
+}
+
+fn menu_bottom_bar_line(inner_width: u16, palette: &ThemePalette) -> Line<'static> {
+    let full: [(&'static str, &'static str, Color); 8] = [
+        ("[Space]", "Mark", palette.accent),
+        ("[Enter]", "Open", palette.badge_ok),
+        ("[B]", "Browse", palette.accent),
+        ("[A]", "Add", palette.accent),
+        ("[D]", "Del", palette.accent),
+        ("[T]", "Theme", palette.badge_special),
+        ("[?]", "Help", palette.badge_warn),
+        ("[Q]", "Quit", palette.badge_err),
+    ];
+    let compact: [(&'static str, &'static str, Color); 8] = [
+        ("[Space]", "Mark", palette.accent),
+        ("[Enter]", "Open", palette.badge_ok),
+        ("[B]", "Browse", palette.accent),
+        ("[A]", "Add", palette.accent),
+        ("[D]", "Del", palette.accent),
+        ("[T]", "Theme", palette.badge_special),
+        ("[?]", "Help", palette.badge_warn),
+        ("[Q]", "", palette.badge_err),
+    ];
+    let minimal: [(&'static str, &'static str, Color); 5] = [
+        ("[Enter]", "Open", palette.badge_ok),
+        ("[B]", "Browse", palette.accent),
+        ("[T]", "Theme", palette.badge_special),
+        ("[?]", "Help", palette.badge_warn),
+        ("[Q]", "Quit", palette.badge_err),
+    ];
+    pick_fitting_hotkey_line(
+        &[(&full, "  "), (&compact, " "), (&minimal, " ")],
+        inner_width,
+    )
+}
+
+fn player_bottom_bar_line(inner_width: u16, palette: &ThemePalette) -> Line<'static> {
+    let full: [(&'static str, &'static str, Color); 11] = [
+        ("[Space]", "Play", palette.accent),
+        ("[n/p]", "Track", palette.accent),
+        ("[x]", "Stop", palette.accent),
+        ("[←/→]", "Seek", palette.accent),
+        ("[+/-]", "Vol", palette.accent),
+        ("[s]", "Shuf", palette.accent),
+        ("[r]", "Rep", palette.accent),
+        ("[t]", "Theme", palette.badge_special),
+        ("[/]", "Find", palette.badge_warn),
+        ("[?]", "Help", palette.badge_warn),
+        ("[Q]", "Quit", palette.badge_err),
+    ];
+    let medium: [(&'static str, &'static str, Color); 9] = [
+        ("[Space]", "Play", palette.accent),
+        ("[n/p]", "Track", palette.accent),
+        ("[x]", "Stop", palette.accent),
+        ("[←/→]", "Seek", palette.accent),
+        ("[+/-]", "Vol", palette.accent),
+        ("[t]", "Theme", palette.badge_special),
+        ("[/]", "Find", palette.badge_warn),
+        ("[?]", "Help", palette.badge_warn),
+        ("[Q]", "Quit", palette.badge_err),
+    ];
+    let compact: [(&'static str, &'static str, Color); 8] = [
+        ("[Space]", "Play", palette.accent),
+        ("[n/p]", "Track", palette.accent),
+        ("[←/→]", "Seek", palette.accent),
+        ("[+/-]", "Vol", palette.accent),
+        ("[t]", "Theme", palette.badge_special),
+        ("[/]", "Find", palette.badge_warn),
+        ("[?]", "Help", palette.badge_warn),
+        ("[Q]", "", palette.badge_err),
+    ];
+    let minimal: [(&'static str, &'static str, Color); 5] = [
+        ("[Space]", "Play", palette.accent),
+        ("[n/p]", "Track", palette.accent),
+        ("[/]", "Find", palette.badge_warn),
+        ("[?]", "Help", palette.badge_warn),
+        ("[Q]", "Quit", palette.badge_err),
+    ];
+    pick_fitting_hotkey_line(
+        &[(&full, "  "), (&medium, " "), (&compact, " "), (&minimal, " ")],
+        inner_width,
+    )
+}
+
+fn render_help_modal(f: &mut Frame, screen: AppScreen, palette: &ThemePalette) {
+    let area = f.area();
+    let w = area.width.saturating_sub(4).clamp(36, 66);
+    let h = area.height.saturating_sub(4).clamp(12, 20);
+    let popup_area = centered_fixed_rect(w, h, area);
+    f.render_widget(Clear, popup_area);
+
+    let key_style = Style::default().fg(palette.accent_bright).bold();
+    let desc_style = Style::default().fg(palette.text_secondary);
+
+    let mut lines = match screen {
+        AppScreen::Menu => vec![
+            Line::from(Span::styled("LAUNCHER MENU", Style::default().fg(palette.badge_warn).bold())),
+            Line::from(vec![Span::styled("  ↑/↓ or j/k   ", key_style), Span::styled("Move cursor", desc_style)]),
+            Line::from(vec![Span::styled("  Space / Enter", key_style), Span::styled("Mark route / Open directory", desc_style)]),
+            Line::from(vec![Span::styled("  1..9         ", key_style), Span::styled("Quick launch saved route", desc_style)]),
+            Line::from(vec![Span::styled("  b / a / d    ", key_style), Span::styled("Browse / Add / Delete route", desc_style)]),
+            Line::from(vec![Span::styled("  t            ", key_style), Span::styled("Cycle retro color theme", desc_style)]),
+            Line::from(vec![Span::styled("  q / Esc      ", key_style), Span::styled("Quit application", desc_style)]),
+        ],
+        AppScreen::Player => vec![
+            Line::from(Span::styled("MUSIC PLAYER", Style::default().fg(palette.badge_warn).bold())),
+            Line::from(vec![Span::styled("  Space / Enter", key_style), Span::styled("Play/Pause or Play selected track", desc_style)]),
+            Line::from(vec![Span::styled("  x            ", key_style), Span::styled("Stop playback", desc_style)]),
+            Line::from(vec![Span::styled("  n / p (or b) ", key_style), Span::styled("Next / Previous track", desc_style)]),
+            Line::from(vec![Span::styled("  ↑/↓ or j/k   ", key_style), Span::styled("Navigate playlist", desc_style)]),
+            Line::from(vec![Span::styled("  ← / →        ", key_style), Span::styled("Seek -5s / +5s", desc_style)]),
+            Line::from(vec![Span::styled("  + / - / m    ", key_style), Span::styled("Volume Up/Down / Mute", desc_style)]),
+            Line::from(vec![Span::styled("  s / r        ", key_style), Span::styled("Toggle Shuffle / Cycle Repeat (ALL/ONE/ONCE/OFF)", desc_style)]),
+            Line::from(vec![Span::styled("  t / /        ", key_style), Span::styled("Cycle Theme / Search playlist", desc_style)]),
+            Line::from(vec![Span::styled("  Esc / q      ", key_style), Span::styled("Back to Menu / Quit (Ctrl+C always quits)", desc_style)]),
+        ],
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press [?], [Enter], or [Esc] to close",
+        Style::default().fg(palette.text_muted),
+    )));
+
+    let block = Block::default()
+        .title(" ◈ KEYBINDINGS HELP ◈ ")
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(palette.border));
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        popup_area,
+    );
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let mut out: String = s.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Helper function to create a centered popup area by percentage
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1375,4 +1875,94 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// Helper function to create a centered popup area with fixed dimensions clamped to container
+fn centered_fixed_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let w = width.min(r.width);
+    let h = height.min(r.height);
+    let x = r.x + r.width.saturating_sub(w) / 2;
+    let y = r.y + r.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_chars_preserves_short_and_adds_ellipsis_for_long() {
+        assert_eq!(truncate_chars("Hello", 10), "Hello");
+        assert_eq!(truncate_chars("Hello World", 5), "Hell…");
+        assert_eq!(truncate_chars("سلام دنیا", 4), "سلا…");
+        assert_eq!(truncate_chars("Test", 0), "");
+    }
+
+    #[test]
+    fn test_centered_fixed_rect_clamps_to_area() {
+        let area = Rect::new(0, 0, 40, 10);
+        let popup = centered_fixed_rect(60, 15, area);
+        assert_eq!(popup.width, 40);
+        assert_eq!(popup.height, 10);
+    }
+
+    #[test]
+    fn test_is_plain_char_rejects_ctrl_and_alt_modifiers() {
+        assert!(is_plain_char(KeyModifiers::NONE));
+        assert!(is_plain_char(KeyModifiers::SHIFT));
+        assert!(!is_plain_char(KeyModifiers::CONTROL));
+        assert!(!is_plain_char(KeyModifiers::ALT));
+    }
+
+    #[test]
+    fn test_layout_bars_fit_within_80_and_120_columns() {
+        let palette = ThemePalette::for_kind(config::ThemeKind::CyanDeck);
+
+        // 80-col terminal -> inner width inside bordered box is 78
+        let player_line_80 = player_bottom_bar_line(78, &palette);
+        assert!(
+            player_line_80.width() <= 78,
+            "player bottom bar width {} exceeded 78",
+            player_line_80.width()
+        );
+
+        let menu_line_80 = menu_bottom_bar_line(78, &palette);
+        assert!(
+            menu_line_80.width() <= 78,
+            "menu bottom bar width {} exceeded 78",
+            menu_line_80.width()
+        );
+
+        // 120-col terminal -> full bar fits inside 118
+        let player_line_120 = player_bottom_bar_line(118, &palette);
+        assert!(player_line_120.width() <= 118);
+        assert!(player_line_120.to_string().contains("[s] Shuf"));
+    }
+
+    #[test]
+    fn test_progress_bar_width_never_overflows_narrow_column() {
+        // col_width = 22, time = "01:45 / 03:20" (13 chars), brackets+space = 3 chars -> max bar = 6
+        let w = progress_bar_width(22, 13);
+        assert!(w + 3 + 13 <= 22, "bar {} + 16 overflowed 22", w);
+        assert_eq!(w, 6);
+        assert_eq!(progress_bar_width(60, 13), 30);
+    }
+
+    #[test]
+    fn test_now_playing_height_compacts_for_80x24_terminal() {
+        assert_eq!(now_playing_height(19), 12);
+        assert_eq!(now_playing_height(18), 12);
+        assert_eq!(now_playing_height(24), 14);
+    }
+
+    #[test]
+    fn test_top_bar_constraints_give_right_side_enough_room_at_80_cols() {
+        let rects = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(top_bar_constraints(80, 24, 29))
+            .split(Rect::new(0, 0, 80, 1));
+        assert!(rects[0].width >= 24);
+        assert!(rects[1].width >= 21);
+        assert!(rects[2].width >= 29);
+    }
 }

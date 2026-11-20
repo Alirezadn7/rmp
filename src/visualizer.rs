@@ -12,20 +12,21 @@ use std::sync::Arc;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     widgets::Widget,
 };
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use crate::player::SharedAudioBuffer;
+use crate::theme::ThemePalette;
 
 pub const FFT_SIZE: usize = 1024;
 pub const BARS_COUNT: usize = 32;
 
 const MIN_FREQ: f32 = 20.0;
 const MAX_FREQ: f32 = 16000.0;
-const SAMPLE_RATE: f32 = 44100.0;
+const DEFAULT_SAMPLE_RATE: f32 = 44100.0;
 
-const EIGHTH_BLOCKS: [char; 9] = [' ', ' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const EIGHTH_BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 /// Manages FFT processing, windowing, logarithmic binning, and physics state.
 pub struct SpectrumState {
@@ -34,6 +35,7 @@ pub struct SpectrumState {
     fft_scratch: Vec<Complex<f32>>,
     hann_window: Vec<f32>,
     sample_copy_buf: Vec<f32>,
+    sample_rate: f32,
     band_bins: [(usize, usize); BARS_COUNT],
 
     // Normalized bar heights (0.0 to 1.0)
@@ -68,25 +70,7 @@ impl SpectrumState {
             hann_window.push(w);
         }
 
-        // Precalculate logarithmic frequency band boundaries (20 Hz - 16,000 Hz)
-        let bin_width = SAMPLE_RATE / FFT_SIZE as f32;
-        let mut band_bins = [(0usize, 0usize); BARS_COUNT];
-
-        for i in 0..BARS_COUNT {
-            let ratio_low = i as f32 / BARS_COUNT as f32;
-            let ratio_high = (i + 1) as f32 / BARS_COUNT as f32;
-
-            let f_low = MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(ratio_low);
-            let f_high = MIN_FREQ * (MAX_FREQ / MIN_FREQ).powf(ratio_high);
-
-            let k_start = ((f_low / bin_width).floor() as usize).clamp(1, FFT_SIZE / 2 - 1);
-            let mut k_end = ((f_high / bin_width).ceil() as usize).clamp(k_start + 1, FFT_SIZE / 2);
-            if k_end <= k_start {
-                k_end = k_start + 1;
-            }
-
-            band_bins[i] = (k_start, k_end);
-        }
+        let band_bins = Self::compute_band_bins(DEFAULT_SAMPLE_RATE);
 
         Self {
             fft,
@@ -94,10 +78,47 @@ impl SpectrumState {
             fft_scratch,
             hann_window,
             sample_copy_buf,
+            sample_rate: DEFAULT_SAMPLE_RATE,
             band_bins,
             values: [0.0; BARS_COUNT],
             peaks: [0.0; BARS_COUNT],
             peak_hold: [0; BARS_COUNT],
+        }
+    }
+
+    fn compute_band_bins(sample_rate: f32) -> [(usize, usize); BARS_COUNT] {
+        let bin_width = sample_rate / FFT_SIZE as f32;
+        let max_freq = (sample_rate * 0.45).clamp(MIN_FREQ * 2.0, MAX_FREQ);
+        let mut band_bins = [(0usize, 0usize); BARS_COUNT];
+
+        for (i, slot) in band_bins.iter_mut().enumerate() {
+            let ratio_low = i as f32 / BARS_COUNT as f32;
+            let ratio_high = (i + 1) as f32 / BARS_COUNT as f32;
+
+            let f_low = MIN_FREQ * (max_freq / MIN_FREQ).powf(ratio_low);
+            let f_high = MIN_FREQ * (max_freq / MIN_FREQ).powf(ratio_high);
+
+            let k_start = ((f_low / bin_width).floor() as usize).clamp(1, FFT_SIZE / 2 - 1);
+            let mut k_end = ((f_high / bin_width).ceil() as usize).clamp(k_start + 1, FFT_SIZE / 2);
+            if k_end <= k_start {
+                k_end = k_start + 1;
+            }
+
+            *slot = (k_start, k_end);
+        }
+
+        band_bins
+    }
+
+    /// Recompute frequency bin ranges when the active track's sample rate changes.
+    pub fn set_sample_rate(&mut self, sample_rate: u32) {
+        if sample_rate == 0 {
+            return;
+        }
+        let sr = sample_rate as f32;
+        if (sr - self.sample_rate).abs() > 1.0 {
+            self.sample_rate = sr;
+            self.band_bins = Self::compute_band_bins(sr);
         }
     }
 
@@ -192,11 +213,12 @@ impl SpectrumState {
 /// Spectrum Visualizer Widget for Ratatui with 8x sub-cell vertical precision.
 pub struct SpectrumVisualizer<'a> {
     pub state: &'a SpectrumState,
+    pub palette: &'a ThemePalette,
 }
 
 impl<'a> SpectrumVisualizer<'a> {
-    pub fn new(state: &'a SpectrumState) -> Self {
-        Self { state }
+    pub fn new(state: &'a SpectrumState, palette: &'a ThemePalette) -> Self {
+        Self { state, palette }
     }
 }
 
@@ -212,20 +234,32 @@ impl<'a> Widget for SpectrumVisualizer<'a> {
         }
 
         let bar_width: u16 = (area.width / num_bars as u16).max(1);
+        let used_width = bar_width * num_bars as u16;
+        let x_offset = area.x + area.width.saturating_sub(used_width) / 2;
         let total_sub_levels = area.height as usize * 8;
 
         for i in 0..num_bars {
-            let col_x = area.x + (i as u16 * bar_width);
+            let col_x = x_offset + (i as u16 * bar_width);
             if col_x >= area.right() {
                 break;
             }
 
-            let val = self.state.values[i];
-            let peak = self.state.peaks[i];
+            // Merge frequency bands proportionally when terminal is narrower than 32 bars
+            let b_start = i * BARS_COUNT / num_bars;
+            let b_end = ((i + 1) * BARS_COUNT / num_bars)
+                .max(b_start + 1)
+                .min(BARS_COUNT);
+            let mut val = 0.0f32;
+            let mut peak = 0.0f32;
+            for b in b_start..b_end {
+                val = val.max(self.state.values[b]);
+                peak = peak.max(self.state.peaks[b]);
+            }
 
             // 8x sub-cell height calculation
             let bar_sub_h = ((val * total_sub_levels as f32).round() as usize).min(total_sub_levels);
-            let peak_row = ((peak * area.height as f32).round() as usize).saturating_sub(1).min(area.height as usize - 1);
+            let peak_sub = (peak * total_sub_levels as f32).round() as usize;
+            let peak_row = (peak_sub.saturating_sub(1) / 8).min(area.height as usize - 1);
 
             // Draw vertical column from bottom upwards
             for y_off in 0..area.height as usize {
@@ -234,13 +268,13 @@ impl<'a> Widget for SpectrumVisualizer<'a> {
                     break;
                 }
 
-                // Vertical color gradient
+                // Vertical color gradient driven by active retro theme
                 let color = if y_off < (area.height as usize * 35 / 100) {
-                    Color::Rgb(20, 80, 140) // Deep blue base
+                    self.palette.spectrum_low
                 } else if y_off < (area.height as usize * 70 / 100) {
-                    Color::Rgb(30, 180, 220) // Vibrant Cyan mid
+                    self.palette.spectrum_mid
                 } else {
-                    Color::Rgb(120, 230, 255) // Bright Cyan high
+                    self.palette.spectrum_high
                 };
 
                 let cell_sub_bottom = y_off * 8;
@@ -254,8 +288,11 @@ impl<'a> Widget for SpectrumVisualizer<'a> {
                     let fraction = (bar_sub_h - cell_sub_bottom).clamp(1, 8);
                     (EIGHTH_BLOCKS[fraction], Style::default().fg(color))
                 } else if y_off == peak_row && peak > 0.05 {
-                    // Floating amber/orange peak cap
-                    ('▀', Style::default().fg(Color::Rgb(245, 150, 45)))
+                    // Floating peak cap
+                    ('▀', Style::default().fg(self.palette.spectrum_peak))
+                } else if y_off == 0 {
+                    // Subtle hardware LED floor rail when silent
+                    ('▁', Style::default().fg(self.palette.spectrum_floor))
                 } else {
                     (' ', Style::default())
                 };
@@ -273,5 +310,40 @@ impl<'a> Widget for SpectrumVisualizer<'a> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ThemeKind;
+    use crate::theme::ThemePalette;
+
+    #[test]
+    fn test_eighth_blocks_lowest_level_is_one_eighth_block() {
+        assert_eq!(EIGHTH_BLOCKS[1], '▁');
+    }
+
+    #[test]
+    fn test_set_sample_rate_recalculates_band_bins() {
+        let mut state = SpectrumState::new();
+        let bins_44k = state.band_bins;
+        state.set_sample_rate(96_000);
+        assert_ne!(state.band_bins, bins_44k);
+    }
+
+    #[test]
+    fn test_render_downsamples_treble_when_narrow() {
+        let mut state = SpectrumState::new();
+        state.values[BARS_COUNT - 1] = 1.0;
+
+        let palette = ThemePalette::for_kind(ThemeKind::CyanDeck);
+        let area = Rect::new(0, 0, 24, 5);
+        let mut buf = Buffer::empty(area);
+        SpectrumVisualizer::new(&state, &palette).render(area, &mut buf);
+
+        // With 12 bars over width 24, the last bar at x=22 must reflect the active treble band
+        let cell = buf.cell((22, 4)).unwrap();
+        assert_eq!(cell.symbol(), "█");
     }
 }

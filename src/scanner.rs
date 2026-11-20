@@ -183,7 +183,7 @@ pub fn scan_directory<P: AsRef<Path>>(dir: P) -> Result<Vec<Track>> {
     }
 
     // Sort alphabetically by file name (case-insensitive)
-    tracks.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
+    tracks.sort_by_key(|a| a.file_name.to_lowercase());
 
     Ok(tracks)
 }

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use anyhow::{Context, Result};
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use rodio::{source::SeekError, Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 
 /// Maximum PCM sample buffer capacity
 pub const AUDIO_BUFFER_CAPACITY: usize = 2048;
@@ -23,16 +23,36 @@ pub fn create_shared_audio_buffer() -> SharedAudioBuffer {
     Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_CAPACITY)))
 }
 
-/// Custom non-blocking audio tap forwarding PCM samples into a shared circular buffer
-/// using `try_lock()` to ensure the audio playback thread never stalls.
+/// Metadata returned after starting a track.
+#[derive(Debug, Clone, Copy)]
+pub struct PlaybackInfo {
+    pub duration: Option<Duration>,
+    pub sample_rate: u32,
+}
+
+/// Custom non-blocking audio tap forwarding mono-downmixed PCM frames into a shared
+/// circular buffer using `try_lock()` so the audio playback thread never stalls.
 pub struct AudioTap<S> {
     input: S,
     buffer: SharedAudioBuffer,
+    channels: u16,
+    chan_idx: u16,
+    sample_acc: f32,
 }
 
-impl<S> AudioTap<S> {
+impl<S> AudioTap<S>
+where
+    S: Source<Item = f32>,
+{
     pub fn new(input: S, buffer: SharedAudioBuffer) -> Self {
-        Self { input, buffer }
+        let channels = input.channels().max(1);
+        Self {
+            input,
+            buffer,
+            channels,
+            chan_idx: 0,
+            sample_acc: 0.0,
+        }
     }
 }
 
@@ -46,12 +66,21 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         let sample = self.input.next()?;
 
-        // Non-blocking try_lock: playback thread never stutters if UI thread is reading
-        if let Ok(mut lock) = self.buffer.try_lock() {
-            if lock.len() >= AUDIO_BUFFER_CAPACITY {
-                lock.pop_front();
+        self.sample_acc += sample;
+        self.chan_idx += 1;
+
+        if self.chan_idx >= self.channels {
+            let mono = self.sample_acc / self.channels as f32;
+            self.sample_acc = 0.0;
+            self.chan_idx = 0;
+
+            // Non-blocking try_lock: playback thread never stutters if UI thread is reading
+            if let Ok(mut lock) = self.buffer.try_lock() {
+                if lock.len() >= AUDIO_BUFFER_CAPACITY {
+                    lock.pop_front();
+                }
+                lock.push_back(mono);
             }
-            lock.push_back(sample);
         }
 
         Some(sample)
@@ -86,6 +115,15 @@ where
     fn total_duration(&self) -> Option<Duration> {
         self.input.total_duration()
     }
+
+    #[inline]
+    fn try_seek(&mut self, pos: Duration) -> std::result::Result<(), SeekError> {
+        self.input.try_seek(pos)?;
+        if let Ok(mut lock) = self.buffer.try_lock() {
+            lock.clear();
+        }
+        Ok(())
+    }
 }
 
 /// Audio player handling decoding, seeking, PCM tapping, and playback controls.
@@ -102,23 +140,23 @@ pub struct Player {
 }
 
 impl Player {
-    /// Initialize the audio device output stream and playback sink.
-    pub fn new() -> Result<Self> {
+    /// Initialize the audio device output stream and playback sink with initial volume (0.0..=1.0).
+    pub fn with_volume(initial_volume: f32) -> Result<Self> {
         let (_stream, stream_handle) = OutputStream::try_default()
             .context("Failed to initialize default audio output device")?;
 
         let sink = Sink::try_new(&stream_handle)
             .context("Failed to create audio playback sink")?;
 
-        let default_volume = 0.85; // 85% default matching UI
-        sink.set_volume(default_volume);
+        let vol = initial_volume.clamp(0.0, 1.0);
+        sink.set_volume(vol);
 
         Ok(Self {
             _stream,
             stream_handle,
             sink,
-            volume: default_volume,
-            saved_volume: default_volume,
+            volume: vol,
+            saved_volume: vol,
             is_muted: false,
             current_path: None,
             total_duration: None,
@@ -132,8 +170,8 @@ impl Player {
     }
 
     /// Load and play an audio track from the given file path.
-    /// Returns the exact total duration if provided by the decoder.
-    pub fn play<P: AsRef<Path>>(&mut self, track_path: P) -> Result<Option<Duration>> {
+    /// Returns duration and sample rate for visualizer calibration.
+    pub fn play<P: AsRef<Path>>(&mut self, track_path: P) -> Result<PlaybackInfo> {
         let path = track_path.as_ref();
         let file = File::open(path)
             .with_context(|| format!("Failed to open audio file: {}", path.display()))?;
@@ -143,6 +181,7 @@ impl Player {
             .with_context(|| format!("Failed to decode audio file: {}", path.display()))?;
 
         let duration = source.total_duration();
+        let sample_rate = source.sample_rate().max(8000);
 
         // Clear buffer for new track
         if let Ok(mut buf) = self.audio_buffer.lock() {
@@ -165,7 +204,10 @@ impl Player {
         self.current_path = Some(path.to_path_buf());
         self.total_duration = duration;
 
-        Ok(duration)
+        Ok(PlaybackInfo {
+            duration,
+            sample_rate,
+        })
     }
 
     /// Pause the current playback.
@@ -260,7 +302,10 @@ impl Player {
     }
 
     /// Seek forward by seconds.
-    pub fn seek_forward(&mut self, secs: u64) {
+    pub fn seek_forward(&mut self, secs: u64) -> Result<()> {
+        if self.sink.empty() {
+            return Ok(());
+        }
         let cur = self.elapsed();
         let target = cur + Duration::from_secs(secs);
         let clamped = if let Some(tot) = self.total_duration {
@@ -268,11 +313,16 @@ impl Player {
         } else {
             target
         };
-        let _ = self.sink.try_seek(clamped);
+        self.sink
+            .try_seek(clamped)
+            .map_err(|e| anyhow::anyhow!("Seek failed: {e:?}"))
     }
 
     /// Seek backward by seconds.
-    pub fn seek_backward(&mut self, secs: u64) {
+    pub fn seek_backward(&mut self, secs: u64) -> Result<()> {
+        if self.sink.empty() {
+            return Ok(());
+        }
         let cur = self.elapsed();
         let step = Duration::from_secs(secs);
         let target = if cur > step {
@@ -280,11 +330,73 @@ impl Player {
         } else {
             Duration::ZERO
         };
-        let _ = self.sink.try_seek(target);
+        self.sink
+            .try_seek(target)
+            .map_err(|e| anyhow::anyhow!("Seek failed: {e:?}"))
     }
 
     #[allow(dead_code)]
     pub fn current_path(&self) -> Option<&Path> {
         self.current_path.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rodio::buffer::SamplesBuffer;
+
+    #[test]
+    fn test_audio_tap_downmixes_stereo_to_mono_preserving_output() {
+        let buf = create_shared_audio_buffer();
+        // 2 stereo frames: (0.2, 0.6) -> avg 0.4, (-0.4, 0.0) -> avg -0.2
+        let src = SamplesBuffer::new(2, 44_100, vec![0.2_f32, 0.6, -0.4, 0.0]);
+        let tap = AudioTap::new(src, buf.clone());
+        let output: Vec<f32> = tap.collect();
+
+        // Output to rodio Sink must stay stereo-interleaved unchanged
+        assert_eq!(output, vec![0.2_f32, 0.6, -0.4, 0.0]);
+
+        // Shared FFT buffer must contain 2 mono-averaged frames, not 4 interleaved samples
+        let captured: Vec<f32> = buf.lock().unwrap().iter().copied().collect();
+        assert_eq!(captured.len(), 2);
+        assert!((captured[0] - 0.4).abs() < 1e-6);
+        assert!((captured[1] - (-0.2)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_tap_delegates_try_seek_preserving_channel_alignment() {
+        let buf = create_shared_audio_buffer();
+        // 1 second of stereo audio at 100 Hz (200 samples total), sample i has value i as f32
+        let samples: Vec<f32> = (0..200).map(|i| i as f32).collect();
+        let src = SamplesBuffer::new(2, 100, samples);
+        let mut tap = AudioTap::new(src, buf.clone());
+
+        // Read one full stereo frame (left=0.0, right=1.0)
+        assert_eq!(tap.next(), Some(0.0));
+        assert_eq!(tap.next(), Some(1.0));
+
+        // Seek to 500ms -> frame 50 -> sample index 100 (left=100.0, right=101.0)
+        tap.try_seek(Duration::from_millis(500))
+            .expect("AudioTap must forward try_seek to underlying seekable source");
+
+        assert_eq!(tap.next(), Some(100.0));
+        assert_eq!(tap.next(), Some(101.0));
+
+        let captured: Vec<f32> = buf.lock().unwrap().iter().copied().collect();
+        // Pre-seek frame was cleared on seek; only the post-seek frame remains
+        assert_eq!(captured.len(), 1);
+        assert!((captured[0] - 100.5).abs() < 1e-6);
+
+        // Also verify mid-frame seek keeps stereo channel alignment intact (rodio contract)
+        assert_eq!(tap.next(), Some(102.0)); // left channel only
+        tap.try_seek(Duration::from_millis(200))
+            .expect("Mid-frame try_seek must succeed");
+        // SamplesBuffer seeks to right channel of previous frame (39.0) before next full frame (40.0, 41.0)
+        assert_eq!(tap.next(), Some(39.0));
+        assert_eq!(tap.next(), Some(40.0));
+        assert_eq!(tap.next(), Some(41.0));
+        let last_mono = *buf.lock().unwrap().back().unwrap();
+        assert!((last_mono - 40.5).abs() < 1e-6);
     }
 }
